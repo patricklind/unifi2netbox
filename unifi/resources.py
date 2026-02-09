@@ -43,7 +43,7 @@ class BaseResource:
         self._name = value
 
     def _build_url(self, item_id=None, path=None):
-        site_name = self.site.name
+        site_name = getattr(self.site, "api_id", self.site.name)
         parts = [self.api_path, site_name]
         if self.base_path:
             parts.append(self.base_path)
@@ -60,6 +60,9 @@ class BaseResource:
         if response is None:
             return None
         if isinstance(response, dict):
+            status_code = response.get("statusCode")
+            if isinstance(status_code, int) and status_code >= 400:
+                return None
             meta = response.get("meta")
             if isinstance(meta, dict):
                 if meta.get("rc") == "ok":

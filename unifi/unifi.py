@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 class Unifi:
     """
-    Handles interactions with UniFi API, including session management,
-    authentication, and API requests.
+    Handles interactions with UniFi API for both:
+    - Integration API v1 (API key)
+    - Legacy / UniFi OS session login (username/password)
     """
 
     SESSION_FILE = os.path.expanduser("~/.unifi_session.json")
@@ -42,28 +43,61 @@ class Unifi:
         },
     )
 
-    def __init__(self, base_url=None, username=None, password=None, mfa_secret=None):
+    def __init__(
+        self,
+        base_url=None,
+        username=None,
+        password=None,
+        mfa_secret=None,
+        api_key=None,
+        api_key_header=None,
+    ):
         logger.debug(f"Initializing UniFi connection to: {base_url}")
         self.base_url = base_url.rstrip("/") if base_url else base_url
         self.username = username
         self.password = password
         self.mfa_secret = mfa_secret
+        self.api_key = api_key
+        self.api_key_header = api_key_header
+
         self.session = requests.Session()
         self.session_cookie = None
         self.csrf_token = None
         self.auth_mode = None
         self.api_prefix = ""
 
-        if not all([self.base_url, self.username, self.password]):
-            logger.error("Missing required parameters for UniFi connection")
-            raise ValueError(
-                "Missing required environment variables: BASE_URL, USERNAME, or PASSWORD"
-            )
+        self.api_style = None  # "integration" or "legacy"
+        self.integration_api_base = None
+        self.integration_auth_headers = {}
+
+        if not self.base_url:
+            raise ValueError("Missing required configuration: UniFi base URL")
 
         logger.debug("Loading session from file")
         self.load_session_from_file()
-        logger.debug("Authenticating with UniFi controller")
-        self.authenticate()
+
+        # Prefer Integration API when API key is provided.
+        if self.api_key and self.configure_integration_api():
+            self.api_style = "integration"
+            logger.info(
+                f"Using UniFi Integration API at {self.integration_api_base}"
+            )
+        else:
+            if self.api_key:
+                logger.warning(
+                    "UNIFI_API_KEY provided but Integration API could not be validated. "
+                    "Falling back to session-based login."
+                )
+
+            if not all([self.username, self.password]):
+                raise ValueError(
+                    "Missing credentials. Provide UNIFI_API_KEY or UNIFI_USERNAME + UNIFI_PASSWORD"
+                )
+
+            self.api_style = "legacy"
+            logger.debug("Authenticating with UniFi controller via session login")
+            self.authenticate()
+
         logger.debug("Fetching sites from UniFi controller")
         self.sites = self.get_sites()
         logger.debug(f"Initialized UniFi connection with {len(self.sites)} sites")
@@ -76,13 +110,33 @@ class Unifi:
             return None
 
     def _build_api_url(self, endpoint):
-        """Build URL and prepend UniFi OS proxy prefix when required."""
+        """Build URL for legacy APIs (session/cookie auth)."""
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
             return endpoint
         normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
         if self.api_prefix and not normalized_endpoint.startswith(self.api_prefix):
             normalized_endpoint = f"{self.api_prefix}{normalized_endpoint}"
         return f"{self.base_url}{normalized_endpoint}"
+
+    def _build_integration_url(self, endpoint):
+        """Build URL for Integration API v1 based on discovered integration base path."""
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            return endpoint
+
+        normalized = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+
+        # Accept either "/sites" style or "/v1/sites" style.
+        if normalized.startswith("/proxy/network/integration/v1"):
+            normalized = normalized[len("/proxy/network/integration/v1") :]
+        elif normalized.startswith("/integration/v1"):
+            normalized = normalized[len("/integration/v1") :]
+        elif normalized.startswith("/v1"):
+            normalized = normalized[len("/v1") :]
+
+        if not normalized:
+            normalized = "/"
+
+        return f"{self.integration_api_base}{normalized}"
 
     def _get_auth_mode_candidates(self):
         """Prioritize the previously working auth mode to reduce retries."""
@@ -129,6 +183,111 @@ class Unifi:
                 or self.csrf_token
             )
 
+    def _integration_base_candidates(self):
+        if "/integration/v1" in self.base_url:
+            return [self.base_url]
+        return [
+            f"{self.base_url}/proxy/network/integration/v1",
+            f"{self.base_url}/integration/v1",
+        ]
+
+    def _integration_header_candidates(self):
+        if not self.api_key:
+            return []
+
+        candidates = []
+
+        if self.api_key_header:
+            header = self.api_key_header.strip()
+            if header.lower() == "authorization":
+                candidates.append({"Authorization": f"Bearer {self.api_key}"})
+                candidates.append({"Authorization": f"Token {self.api_key}"})
+                candidates.append({"Authorization": self.api_key})
+            else:
+                candidates.append({header: self.api_key})
+
+        candidates.extend(
+            [
+                {"X-API-KEY": self.api_key},
+                {"X-Api-Key": self.api_key},
+                {"Authorization": f"Bearer {self.api_key}"},
+                {"Authorization": f"Token {self.api_key}"},
+                {"Authorization": self.api_key},
+            ]
+        )
+
+        unique = []
+        seen = set()
+        for item in candidates:
+            signature = tuple(sorted(item.items()))
+            if signature not in seen:
+                seen.add(signature)
+                unique.append(item)
+        return unique
+
+    def configure_integration_api(self):
+        """Detect working Integration API base URL + auth header format."""
+        if not self.api_key:
+            return False
+
+        for base in self._integration_base_candidates():
+            for auth_headers in self._integration_header_candidates():
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    **auth_headers,
+                }
+
+                # Probe /info first (lightweight endpoint)
+                info_url = f"{base}/info"
+                try:
+                    response = self.session.get(
+                        info_url,
+                        headers=headers,
+                        verify=False,
+                        timeout=self.DEFAULT_TIMEOUT,
+                    )
+                except requests.exceptions.RequestException as err:
+                    logger.debug(
+                        f"Integration probe failed for {info_url} with headers {list(auth_headers.keys())}: {err}"
+                    )
+                    continue
+
+                response_data = self._parse_response_json(response)
+                if response.status_code < 400 and isinstance(response_data, dict):
+                    if response_data.get("applicationVersion"):
+                        self.integration_api_base = base
+                        self.integration_auth_headers = auth_headers
+                        logger.debug(
+                            f"Integration API validated via /info at {base} using {list(auth_headers.keys())}"
+                        )
+                        return True
+
+                # Fallback probe: /sites
+                sites_url = f"{base}/sites"
+                try:
+                    sites_response = self.session.get(
+                        sites_url,
+                        headers=headers,
+                        params={"offset": 0, "limit": 1},
+                        verify=False,
+                        timeout=self.DEFAULT_TIMEOUT,
+                    )
+                except requests.exceptions.RequestException:
+                    continue
+
+                sites_data = self._parse_response_json(sites_response)
+                if sites_response.status_code < 400 and isinstance(sites_data, dict):
+                    if isinstance(sites_data.get("data"), list):
+                        self.integration_api_base = base
+                        self.integration_auth_headers = auth_headers
+                        logger.debug(
+                            f"Integration API validated via /sites at {base} using {list(auth_headers.keys())}"
+                        )
+                        return True
+
+        return False
+
     def save_session_to_file(self):
         """Save session data to file, grouped by base_url."""
         logger.debug(f"Saving session data for {self.base_url}")
@@ -137,6 +296,9 @@ class Unifi:
             "csrf_token": self.csrf_token,
             "auth_mode": self.auth_mode,
             "api_prefix": self.api_prefix,
+            "api_style": self.api_style,
+            "integration_api_base": self.integration_api_base,
+            "integration_auth_headers": self.integration_auth_headers,
         }
         with file_lock:
             logger.debug(f"Acquired file lock for {self.SESSION_FILE}")
@@ -173,11 +335,20 @@ class Unifi:
         self.csrf_token = session_info.get("csrf_token")
         self.auth_mode = session_info.get("auth_mode")
         self.api_prefix = session_info.get("api_prefix", "")
+
+        cached_style = session_info.get("api_style")
+        if cached_style in {"legacy", "integration"}:
+            self.api_style = cached_style
+        self.integration_api_base = session_info.get("integration_api_base")
+        headers = session_info.get("integration_auth_headers")
+        if isinstance(headers, dict):
+            self.integration_auth_headers = headers
+
         self._refresh_session_metadata()
         logger.info(f"Loaded session data for {self.base_url} from file.")
 
     def authenticate(self, retry_count=0, max_retries=3):
-        """Log in and prepare an authenticated session."""
+        """Log in and prepare an authenticated legacy session."""
         logger.debug(f"Authentication attempt {retry_count + 1}/{max_retries + 1}")
         if retry_count >= max_retries:
             logger.error("Max authentication retries reached. Aborting authentication.")
@@ -250,10 +421,7 @@ class Unifi:
             + ("; ".join(auth_errors) if auth_errors else "No auth mode succeeded.")
         )
 
-    def make_request(self, endpoint, method="GET", data=None, retry_count=0, max_retries=3):
-        """Make an authenticated request to the UniFi API."""
-        logger.debug(f"API request: {method} {endpoint}")
-
+    def _make_request_legacy(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
         if not self.session.cookies.get_dict():
             logger.info("No valid session cookies present. Authenticating...")
             self.authenticate()
@@ -264,12 +432,13 @@ class Unifi:
 
         url = self._build_api_url(endpoint)
         method_upper = method.upper()
-        logger.debug(f"Making {method_upper} request to: {url}")
+        logger.debug(f"Making legacy {method_upper} request to: {url}")
 
         request_kwargs = {
             "headers": headers,
             "verify": False,
             "timeout": self.DEFAULT_TIMEOUT,
+            "params": params,
         }
         if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
             request_kwargs["json"] = data
@@ -286,10 +455,11 @@ class Unifi:
         if response.status_code == 401 and retry_count < max_retries:
             logger.warning("Session expired or unauthorized. Re-authenticating...")
             self.authenticate(retry_count=0, max_retries=max_retries)
-            return self.make_request(
+            return self._make_request_legacy(
                 endpoint,
                 method=method_upper,
                 data=data,
+                params=params,
                 retry_count=retry_count + 1,
                 max_retries=max_retries,
             )
@@ -299,25 +469,161 @@ class Unifi:
             if isinstance(response_data, dict):
                 logger.error(
                     f"Request failed with {response.status_code}: "
-                    f"{response_data.get('meta', {}).get('msg', 'unknown error')}"
+                    f"{response_data.get('meta', {}).get('msg', response_data.get('message', 'unknown error'))}"
                 )
                 return response_data
             logger.error(
                 f"Request failed with {response.status_code} and non-JSON response."
             )
-            return None
+            return {
+                "statusCode": response.status_code,
+                "message": response.text,
+            }
 
         if response_data is None:
             logger.error("Received non-JSON response from UniFi API.")
             return None
 
         if isinstance(response_data, dict):
-            logger.debug(f"Request successful, response meta: {response_data.get('meta', {})}")
+            logger.debug(f"Request successful, response keys: {list(response_data.keys())}")
         return response_data
 
-    def get_sites(self) -> dict:
-        """Fetch and return all sites from the UniFi controller."""
-        logger.debug(f"Fetching sites from UniFi controller at {self.base_url}")
+    def _make_request_integration(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
+        if not self.integration_api_base:
+            if not self.configure_integration_api():
+                logger.error("Integration API is not configured.")
+                return {
+                    "statusCode": 401,
+                    "message": "Integration API not configured",
+                }
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            **self.integration_auth_headers,
+        }
+
+        url = self._build_integration_url(endpoint)
+        method_upper = method.upper()
+        logger.debug(f"Making integration {method_upper} request to: {url}")
+
+        request_kwargs = {
+            "headers": headers,
+            "verify": False,
+            "timeout": self.DEFAULT_TIMEOUT,
+            "params": params,
+        }
+        if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
+            request_kwargs["json"] = data
+
+        try:
+            response = self.session.request(method_upper, url, **request_kwargs)
+        except requests.exceptions.RequestException as err:
+            logger.error(f"Integration request exception: {err}")
+            logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
+            return None
+
+        response_data = self._parse_response_json(response)
+
+        if response.status_code == 401 and retry_count < max_retries:
+            # Retry header/base detection once in case auth header format changed.
+            if self.configure_integration_api():
+                return self._make_request_integration(
+                    endpoint,
+                    method=method_upper,
+                    data=data,
+                    params=params,
+                    retry_count=retry_count + 1,
+                    max_retries=max_retries,
+                )
+
+        if response.status_code >= 400:
+            if isinstance(response_data, dict):
+                logger.error(
+                    f"Integration request failed with {response.status_code}: "
+                    f"{response_data.get('code', response_data.get('message', 'unknown error'))}"
+                )
+                return response_data
+            logger.error(
+                f"Integration request failed with {response.status_code} and non-JSON response."
+            )
+            return {
+                "statusCode": response.status_code,
+                "message": response.text,
+            }
+
+        if response_data is None:
+            logger.error("Received non-JSON response from Integration API.")
+            return None
+
+        return response_data
+
+    def make_request(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
+        """Make an authenticated request to the selected UniFi API style."""
+        logger.debug(f"API request ({self.api_style}): {method} {endpoint}")
+        if self.api_style == "integration":
+            return self._make_request_integration(
+                endpoint,
+                method=method,
+                data=data,
+                params=params,
+                retry_count=retry_count,
+                max_retries=max_retries,
+            )
+        return self._make_request_legacy(
+            endpoint,
+            method=method,
+            data=data,
+            params=params,
+            retry_count=retry_count,
+            max_retries=max_retries,
+        )
+
+    def _get_sites_integration(self):
+        """Fetch sites from Integration API (/sites)."""
+        offset = 0
+        limit = 200
+        sites = []
+
+        while True:
+            response = self.make_request(
+                "/sites",
+                "GET",
+                params={"offset": offset, "limit": limit},
+            )
+            if not isinstance(response, dict):
+                raise ValueError("No sites found (invalid response shape)")
+
+            data = response.get("data")
+            if not isinstance(data, list):
+                raise ValueError(
+                    f"No sites found (missing data list): {response}"
+                )
+
+            sites.extend(data)
+            logger.debug(f"Retrieved {len(data)} sites at offset {offset}")
+
+            if not data:
+                break
+
+            offset += len(data)
+            total_count = response.get("totalCount")
+            if isinstance(total_count, int) and offset >= total_count:
+                break
+            if len(data) < response.get("limit", limit):
+                break
+
+        site_dict = {}
+        for site in sites:
+            site_obj = Sites(self, site)
+            key = site.get("name") or site.get("internalReference") or site.get("id")
+            if key:
+                site_dict[key] = site_obj
+
+        return site_dict
+
+    def _get_sites_legacy(self):
+        """Fetch sites from legacy/UniFi OS APIs."""
         response = self.make_request("/api/self/sites", "GET")
 
         if not response:
@@ -328,26 +634,35 @@ class Unifi:
         if response.get("meta", {}).get("rc") == "ok":
             sites = response.get("data", [])
             logger.debug(f"Found {len(sites)} sites on controller")
-            for site in sites:
-                logger.debug(f"Site found: {site.get('name')} - {site.get('desc')}")
-
             site_dict = {site["desc"]: Sites(self, site) for site in sites}
-            logger.debug(f"Created {len(site_dict)} Site objects")
             return site_dict
 
         error_msg = response.get("meta", {}).get("msg")
         logger.error(f"Failed to get sites: {error_msg}")
         return {}
 
+    def get_sites(self) -> dict:
+        """Fetch and return all sites from the selected UniFi API style."""
+        logger.debug(f"Fetching sites from UniFi controller at {self.base_url}")
+        if self.api_style == "integration":
+            return self._get_sites_integration()
+        return self._get_sites_legacy()
+
     def site(self, name):
-        """Get a single site by name."""
-        logger.debug(f"Looking up site: {name}")
+        """Get a single site by name, internal reference, or API id."""
         site = self.sites.get(name)
         if site:
-            logger.debug(f"Found site: {name}")
-        else:
-            logger.debug(f"Site not found: {name}")
-        return site
+            return site
+
+        for site_obj in self.sites.values():
+            if name in {
+                site_obj.name,
+                getattr(site_obj, "desc", None),
+                getattr(site_obj, "internal_reference", None),
+                getattr(site_obj, "api_id", None),
+            }:
+                return site_obj
+        return None
 
     def __getitem__(self, name):
         """Shortcut for accessing a site."""
