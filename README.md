@@ -43,6 +43,7 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    UNIFI_MFA_SECRET=your-unifi-mfa-secret
    NETBOX_TOKEN=your-netbox-api-token
    ```
+   `UNIFI_MFA_SECRET` is optional if your UniFi account does not use TOTP-based 2FA.
 
 4. Copy the sample configuration file to `config/config.yaml`:
    ```bash
@@ -207,6 +208,7 @@ If you encounter issues with the integration:
 5. **API connectivity**: 
    - Ensure the UniFi controller is accessible at the configured URL
    - Verify the NetBox API is reachable and responding
+   - The client auto-detects both UniFi OS (`/api/auth/login` with `/proxy/network`) and legacy controller (`/api/login`) API styles.
 
 6. **Session issues**: If you encounter authentication problems, try deleting the session file and running again
 

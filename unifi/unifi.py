@@ -1,12 +1,14 @@
-import logging
-import requests
-import warnings
 import json
+import logging
 import os
-
-from urllib3.exceptions import InsecureRequestWarning
-import pyotp
 import threading
+import time
+import warnings
+
+import pyotp
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+
 from .sites import Sites
 
 file_lock = threading.Lock()
@@ -16,47 +18,47 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
+
 class Unifi:
     """
-    Handles interactions with UniFi API, including session management, authentication,
-    and making API requests.
-
-    This class is designed to manage authentication and handle sessions for interacting
-    with UniFi API endpoints. It supports saving and loading session details to and from
-    a file to minimize frequent reauthentication. It also includes methods for making
-    authenticated requests using various HTTP methods.
-
-    :ivar base_url: Base URL of the UniFi API, retrieved from environment variable
-    :ivar username: Username for authentication, retrieved from environment variable
-    :ivar password: Password for authentication, retrieved from environment variable
-    :ivar mfa_secret: Secret key for Multi-Factor Authentication, retrieved from environment variable
-    :ivar udm_pro: Specific path for UDM-Pro; initialized as an empty string
-    :ivar session_cookie: Cookie for managing UniFi sessions, initializes as None
-    :ivar csrf_token: CSRF token for API requests, initializes as None
-    :type base_url: str
-    :type username: str
-    :type password: str
-    :type mfa_secret: str
-    :type udm_pro: str
-    :type session_cookie: Optional[str]
-    :type csrf_token: Optional[str]
+    Handles interactions with UniFi API, including session management,
+    authentication, and API requests.
     """
+
     SESSION_FILE = os.path.expanduser("~/.unifi_session.json")
-    _session_data = {}  # Class-level session storage by base_url
+    DEFAULT_TIMEOUT = 15
+    _session_data = {}
+
+    AUTH_MODES = (
+        {
+            "name": "unifi_os",
+            "login_endpoint": "/api/auth/login",
+            "api_prefix": "/proxy/network",
+        },
+        {
+            "name": "legacy",
+            "login_endpoint": "/api/login",
+            "api_prefix": "",
+        },
+    )
 
     def __init__(self, base_url=None, username=None, password=None, mfa_secret=None):
         logger.debug(f"Initializing UniFi connection to: {base_url}")
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/") if base_url else base_url
         self.username = username
         self.password = password
         self.mfa_secret = mfa_secret
-        self.udm_pro = ''
+        self.session = requests.Session()
         self.session_cookie = None
         self.csrf_token = None
+        self.auth_mode = None
+        self.api_prefix = ""
 
-        if not all([self.base_url, self.username, self.password, self.mfa_secret]):
+        if not all([self.base_url, self.username, self.password]):
             logger.error("Missing required parameters for UniFi connection")
-            raise ValueError("Missing required environment variables: BASE_URL, USERNAME, PASSWORD, or MFA_SECRET")
+            raise ValueError(
+                "Missing required environment variables: BASE_URL, USERNAME, or PASSWORD"
+            )
 
         logger.debug("Loading session from file")
         self.load_session_from_file()
@@ -66,237 +68,276 @@ class Unifi:
         self.sites = self.get_sites()
         logger.debug(f"Initialized UniFi connection with {len(self.sites)} sites")
 
+    def _parse_response_json(self, response):
+        """Parse JSON from a response and return None for non-JSON bodies."""
+        try:
+            return response.json()
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    def _build_api_url(self, endpoint):
+        """Build URL and prepend UniFi OS proxy prefix when required."""
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            return endpoint
+        normalized_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+        if self.api_prefix and not normalized_endpoint.startswith(self.api_prefix):
+            normalized_endpoint = f"{self.api_prefix}{normalized_endpoint}"
+        return f"{self.base_url}{normalized_endpoint}"
+
+    def _get_auth_mode_candidates(self):
+        """Prioritize the previously working auth mode to reduce retries."""
+        modes = list(self.AUTH_MODES)
+        if self.auth_mode:
+            modes.sort(key=lambda mode: mode["name"] != self.auth_mode)
+        return modes
+
+    def _build_login_payload(self):
+        """Build login payload with optional 2FA token."""
+        payload = {
+            "username": self.username,
+            "password": self.password,
+        }
+        otp = None
+        if self.mfa_secret:
+            otp = pyotp.TOTP(self.mfa_secret)
+            payload["ubic_2fa_token"] = otp.now()
+        return payload, otp
+
+    def _wait_for_next_totp(self, otp):
+        """Wait for the next TOTP code to avoid immediate retry failures."""
+        if not otp:
+            return
+        time_remaining = otp.interval - (int(time.time()) % otp.interval)
+        logger.warning(
+            f"Invalid 2FA token detected. Next token available in {time_remaining}s."
+        )
+        while time_remaining > 0:
+            print(f"\rRetrying authentication in {time_remaining} seconds...", end="")
+            time.sleep(1)
+            time_remaining -= 1
+        print("\nRetrying now!")
+
+    def _refresh_session_metadata(self, response=None):
+        """Refresh auth metadata from session cookies and response headers."""
+        cookie_dict = self.session.cookies.get_dict()
+        self.session_cookie = cookie_dict.get("unifises") or cookie_dict.get("TOKEN")
+        if response:
+            self.csrf_token = (
+                response.headers.get("X-CSRF-Token")
+                or response.headers.get("x-csrf-token")
+                or self.session.cookies.get("csrf_token")
+                or self.csrf_token
+            )
+
     def save_session_to_file(self):
         """Save session data to file, grouped by base_url."""
-        # Ensure session data for the current base_url is saved
         logger.debug(f"Saving session data for {self.base_url}")
-
         self._session_data[self.base_url] = {
-            "session_cookie": self.session_cookie,
-            "csrf_token": self.csrf_token
+            "cookies": self.session.cookies.get_dict(),
+            "csrf_token": self.csrf_token,
+            "auth_mode": self.auth_mode,
+            "api_prefix": self.api_prefix,
         }
         with file_lock:
             logger.debug(f"Acquired file lock for {self.SESSION_FILE}")
             with open(self.SESSION_FILE, "w") as f:
                 json.dump(self._session_data, f)
             logger.info(f"Session data for {self.base_url} saved to file.")
-            logger.debug(f"Session cookie length: {len(self.session_cookie) if self.session_cookie else 0} characters")
 
     def load_session_from_file(self):
         """Load session data from file for the current base_url."""
         logger.debug(f"Checking for session file at {self.SESSION_FILE}")
-        if os.path.exists(self.SESSION_FILE):
-            logger.debug(f"Session file exists, loading data")
+        if not os.path.exists(self.SESSION_FILE):
+            logger.debug("No session file found, will authenticate from scratch")
+            return
+
+        try:
             with open(self.SESSION_FILE, "r") as f:
                 self._session_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as err:
+            logger.warning(
+                f"Failed to load existing UniFi session cache, ignoring it: {err}"
+            )
+            self._session_data = {}
+            return
 
-            # Load session data specific to this base_url, if it exists
-            if self.base_url in self._session_data:
-                logger.debug(f"Found session data for {self.base_url}")
-                session_info = self._session_data[self.base_url]
-                self.session_cookie = session_info.get("session_cookie")
-                self.csrf_token = session_info.get("csrf_token")
-                logger.info(f"Loaded session data for {self.base_url} from file.")
-                logger.debug(f"Session cookie loaded: {bool(self.session_cookie)}")
-            else:
-                logger.debug(f"No session data found for {self.base_url}")
-        else:
-            logger.debug("No session file found, will authenticate from scratch")
+        session_info = self._session_data.get(self.base_url)
+        if not session_info:
+            logger.debug(f"No session data found for {self.base_url}")
+            return
+
+        logger.debug(f"Found session data for {self.base_url}")
+        cookies = session_info.get("cookies", {})
+        if isinstance(cookies, dict):
+            self.session.cookies.update(cookies)
+        self.csrf_token = session_info.get("csrf_token")
+        self.auth_mode = session_info.get("auth_mode")
+        self.api_prefix = session_info.get("api_prefix", "")
+        self._refresh_session_metadata()
+        logger.info(f"Loaded session data for {self.base_url} from file.")
 
     def authenticate(self, retry_count=0, max_retries=3):
-        """Logs in and retrieves a session cookie and CSRF token."""
+        """Log in and prepare an authenticated session."""
         logger.debug(f"Authentication attempt {retry_count + 1}/{max_retries + 1}")
         if retry_count >= max_retries:
             logger.error("Max authentication retries reached. Aborting authentication.")
             raise Exception("Authentication failed after maximum retries.")
 
-        login_endpoint = f"{self.base_url}/api/{self.udm_pro}login"
-        logger.debug(f"Using login endpoint: {login_endpoint}")
-        if not self.mfa_secret:
-            logger.error("MFA secret is missing or invalid")
-            raise ValueError("MFA_SECRET is missing or invalid.")
+        payload, otp = self._build_login_payload()
+        auth_errors = []
 
-        logger.debug("Generating TOTP token for authentication")
-        otp = pyotp.TOTP(self.mfa_secret)
-        payload = {
-            "username": self.username,
-            "password": self.password,
-            "ubic_2fa_token": otp.now(),
-        }
-        logger.debug(f"Prepared login data with username: {self.username} and MFA token")
+        for mode in self._get_auth_mode_candidates():
+            login_url = f"{self.base_url}{mode['login_endpoint']}"
+            logger.debug(f"Trying auth mode '{mode['name']}' via {login_url}")
 
-        session = requests.Session()
-        session.timeout = 10
+            try:
+                response = self.session.post(
+                    login_url,
+                    json=payload,
+                    verify=False,
+                    timeout=self.DEFAULT_TIMEOUT,
+                )
+            except requests.exceptions.RequestException as err:
+                logger.warning(f"Auth mode '{mode['name']}' request failed: {err}")
+                auth_errors.append(f"{mode['name']}: request error ({err})")
+                continue
 
-        try:
-            response = session.post(login_endpoint, json=payload, verify=False)
-            response_data = response.json()
-            logger.debug(f"Response data meta: {response_data.get('meta', {})}")
-            # response.raise_for_status()
-            if response_data.get("meta", {}).get("rc") == "ok":
-                logger.info("Logged in successfully.")
-                
-                self.session_cookie = session.cookies.get("unifises")
-                logger.debug(f"Session cookie obtained: {bool(self.session_cookie)}")
-                # self.csrf_token = session.cookies.get("csrf_token")
+            response_data = self._parse_response_json(response) or {}
+            meta = response_data.get("meta", {}) if isinstance(response_data, dict) else {}
+            msg = meta.get("msg")
+            rc = meta.get("rc")
+            self._refresh_session_metadata(response)
+
+            if rc == "ok" or (
+                response.ok and bool(self.session.cookies.get_dict())
+            ):
+                self.auth_mode = mode["name"]
+                self.api_prefix = mode["api_prefix"]
+                self._refresh_session_metadata(response)
                 self.save_session_to_file()
-                logger.debug("Authentication completed successfully")
+                logger.info(
+                    f"Logged in successfully using auth mode '{self.auth_mode}'."
+                )
                 return
-            elif response_data.get("meta", {}).get("msg") == "api.err.Invalid2FAToken":
-                logger.warning("Invalid 2FA token detected. Waiting for the next token...")
-                # Wait for the current TOTP token to expire (~30 seconds for most TOTP systems)
-                import time
-                time_remaining = otp.interval - (int(time.time()) % otp.interval)
-                logger.warning(f"Invalid 2FA token detected. Next token available in {time_remaining}s.")
-                # Countdown for user clarity
-                while time_remaining > 0:
-                    print(f"\rRetrying authentication in {time_remaining} seconds...", end="")
-                    time.sleep(1)
-                    time_remaining -= 1
-                print("\nRetrying now!")
 
-                # Retry authentication with the next token
-                return self.authenticate(retry_count=retry_count + 1, max_retries=max_retries)
-            elif response_data.get("meta", {}).get("msg") == "api.err.Invalid":
-                logger.error(f'Login failed, invalid credentials.')
-                return None
-            else:
-                logger.error(f"Login failed: {response_data.get('meta', {}).get('msg')}")
-                raise Exception("Login failed.")
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP error occurred: {http_err}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Authentication error: {e}. Retrying ({retry_count + 1}/{max_retries})...")
-            return self.authenticate(retry_count=retry_count + 1, max_retries=max_retries)
-        except json.JSONDecodeError as json_err:
-            logger.error(f"Failed to decode JSON response: {json_err}")
-            return None
+            if msg == "api.err.Invalid2FAToken":
+                logger.warning("Invalid 2FA token detected.")
+                self._wait_for_next_totp(otp)
+                return self.authenticate(
+                    retry_count=retry_count + 1, max_retries=max_retries
+                )
+
+            if msg == "api.err.Invalid":
+                logger.error("Login failed: invalid credentials.")
+                raise ValueError("UniFi authentication failed: invalid credentials.")
+
+            if response.status_code in (404, 405):
+                logger.debug(
+                    f"Auth mode '{mode['name']}' unavailable (status {response.status_code})."
+                )
+                auth_errors.append(
+                    f"{mode['name']}: endpoint unavailable ({response.status_code})"
+                )
+                continue
+
+            auth_errors.append(
+                f"{mode['name']}: login failed (status={response.status_code}, msg={msg})"
+            )
+
+        logger.error("UniFi authentication failed for all auth modes.")
+        raise Exception(
+            "Authentication failed. "
+            + ("; ".join(auth_errors) if auth_errors else "No auth mode succeeded.")
+        )
 
     def make_request(self, endpoint, method="GET", data=None, retry_count=0, max_retries=3):
-        """Makes an authenticated request to the UniFi API."""
+        """Make an authenticated request to the UniFi API."""
         logger.debug(f"API request: {method} {endpoint}")
-        # if not self.session_cookie or not self.csrf_token:
-        if not self.session_cookie:
-            logger.info("No valid session. Authenticating...")
-            logger.debug("Session cookie missing, initiating authentication")
+
+        if not self.session.cookies.get_dict():
+            logger.info("No valid session cookies present. Authenticating...")
             self.authenticate()
 
-        headers = {
-            # "X-CSRF-Token": self.csrf_token,
-            "Content-Type": "application/json"
-        }
-        cookies = {
-            "unifises": self.session_cookie
-        }
-        logger.debug(f"Request headers: {headers}")
-        logger.debug(f"Using session cookie: {bool(self.session_cookie)}")
+        headers = {"Content-Type": "application/json"}
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
 
-        url = f"{self.base_url}{endpoint}"
-        logger.debug(f"Making {method} request to: {url}")
+        url = self._build_api_url(endpoint)
+        method_upper = method.upper()
+        logger.debug(f"Making {method_upper} request to: {url}")
+
+        request_kwargs = {
+            "headers": headers,
+            "verify": False,
+            "timeout": self.DEFAULT_TIMEOUT,
+        }
+        if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
+            request_kwargs["json"] = data
 
         try:
-            if method.upper() == "GET":
-                logger.debug(f"Sending GET request to {url}")
-                response = requests.get(url, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "POST":
-                logger.debug(f"Sending POST request to {url} with data")
-                response = requests.post(url, json=data, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "PUT":
-                logger.debug(f"Sending PUT request to {url} with data")
-                response = requests.put(url, json=data, headers=headers, cookies=cookies, verify=False)
-            elif method.upper() == "DELETE":
-                logger.debug(f"Sending DELETE request to {url}")
-                response = requests.delete(url, headers=headers, cookies=cookies, verify=False)
-            else:
-                logger.error(f"Unsupported HTTP method: {method}")
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            
-            logger.debug(f"Response status code: {response.status_code}")
+            response = self.session.request(method_upper, url, **request_kwargs)
+        except requests.exceptions.RequestException as err:
+            logger.error(f"Request exception: {err}")
+            logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
+            return None
 
-            # Handle session expiry
-            if response.status_code == 401:
-                logger.debug("Received 401 Unauthorized response")
-                response_data = response.json()
-                logger.debug(f"Response data for 401: {response_data.get('meta', {})}")
-                if response_data.get('meta', {}).get('rc') == 'error':
-                    if response_data.get('meta', {}).get('msg') == 'api.err.NoSiteContext':
-                        logger.error(f'No Site Context Provided')
-                        return response_data
-                    elif response_data.get('meta', {}).get('msg') == 'api.err.SessionExpired':
-                        logger.warning("Session expired. Re-authenticating...")
-                        logger.debug("Session expired, initiating re-authentication")
-                        self.authenticate()
-                        logger.debug("Re-authentication complete, retrying original request")
-                        return self.make_request(endpoint, method, data, retry_count=0)
-                    elif response_data.get('meta', {}).get('msg') == 'api.err.LoginRequired':
-                        logger.debug("Login required, initiating authentication")
-                        self.authenticate()
-                        logger.debug("Authentication complete, retrying original request")
-                        return self.make_request(endpoint, method, data, retry_count=0)
-                    else:
-                        logger.error(f"Request failed with 401: {response_data.get('meta', {}).get('msg')}")
-                        return response_data
-            elif response.status_code == 400:
-                # Log API errors for debugging
-                response_data = response.json()
-                logger.error(f"Request failed with 400: {response_data.get('meta', {}).get('msg')}")
+        logger.debug(f"Response status code: {response.status_code}")
+
+        if response.status_code == 401 and retry_count < max_retries:
+            logger.warning("Session expired or unauthorized. Re-authenticating...")
+            self.authenticate(retry_count=0, max_retries=max_retries)
+            return self.make_request(
+                endpoint,
+                method=method_upper,
+                data=data,
+                retry_count=retry_count + 1,
+                max_retries=max_retries,
+            )
+
+        response_data = self._parse_response_json(response)
+        if response.status_code >= 400:
+            if isinstance(response_data, dict):
+                logger.error(
+                    f"Request failed with {response.status_code}: "
+                    f"{response_data.get('meta', {}).get('msg', 'unknown error')}"
+                )
                 return response_data
+            logger.error(
+                f"Request failed with {response.status_code} and non-JSON response."
+            )
+            return None
 
-            response.raise_for_status()
-            response_json = response.json()
-            logger.debug(f"Request successful, response meta: {response_json.get('meta', {})}")
-            return response_json
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request exception: {e}")
-            logger.debug(f"Request failed: {method} {url}", exc_info=True)
+        if response_data is None:
+            logger.error("Received non-JSON response from UniFi API.")
             return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode JSON response: {e}")
-            logger.debug(f"Invalid JSON in response from: {url}")
-            return None
+
+        if isinstance(response_data, dict):
+            logger.debug(f"Request successful, response meta: {response_data.get('meta', {})}")
+        return response_data
 
     def get_sites(self) -> dict:
-        """
-        Fetches the list of sites from the Unifi controller.
-
-        This method sends a GET request to the "/api/self/sites" endpoint of the
-        Unifi controller to retrieve a list of available sites. The method returns
-        a dictionary where the keys are the site descriptions and the values are
-        `Sites` objects initialized with the retrieved data.
-
-        :raises ValueError: When no sites are found in the response or an invalid
-            response is received from the controller.
-        :raises KeyError: When the expected data or metadata is missing in the
-            response.
-        :raises Exception: If the request to the controller fails or another
-            unexpected condition occurs.
-
-        :return: A dictionary mapping site descriptions to `Sites` objects.
-        :rtype: dict
-        """
-
-        logger.debug(f'Fetching sites from UniFi controller at {self.base_url}')
+        """Fetch and return all sites from the UniFi controller."""
+        logger.debug(f"Fetching sites from UniFi controller at {self.base_url}")
         response = self.make_request("/api/self/sites", "GET")
 
         if not response:
             logger.error("No response received when fetching sites")
-            raise ValueError(f'No sites found.')
-        
+            raise ValueError("No sites found.")
+
         logger.debug(f"Sites response meta: {response.get('meta', {})}")
-        if response.get('meta', {}).get('rc') == 'ok':
+        if response.get("meta", {}).get("rc") == "ok":
             sites = response.get("data", [])
             logger.debug(f"Found {len(sites)} sites on controller")
             for site in sites:
                 logger.debug(f"Site found: {site.get('name')} - {site.get('desc')}")
-            
+
             site_dict = {site["desc"]: Sites(self, site) for site in sites}
             logger.debug(f"Created {len(site_dict)} Site objects")
             return site_dict
-        else:
-            error_msg = response.get('meta', {}).get('msg')
-            logger.error(f"Failed to get sites: {error_msg}")
-            return {}
+
+        error_msg = response.get("meta", {}).get("msg")
+        logger.error(f"Failed to get sites: {error_msg}")
+        return {}
 
     def site(self, name):
         """Get a single site by name."""
