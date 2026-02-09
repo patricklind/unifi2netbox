@@ -26,6 +26,9 @@ MAX_SITE_THREADS = 8  # Number of sites to process concurrently per controller
 MAX_DEVICE_THREADS = 8  # Number of devices to process concurrently per site
 MAX_THREADS = 8 # Define threads based on available system cores or default
 
+# Populated at runtime from NETBOX.ROLES in config
+netbox_device_roles = {}
+
 def get_postable_fields(base_url, token, url_path):
     """
     Retrieves the POST-able fields for NetBox path.
@@ -253,6 +256,60 @@ def is_access_point_device(device):
         return "radios" in interfaces
     return False
 
+def get_device_features(device):
+    """Normalize feature information from legacy and integration payloads."""
+    features = device.get("features")
+    if isinstance(features, list):
+        return {str(item) for item in features}
+    if isinstance(features, dict):
+        return set(features.keys())
+    return set()
+
+def infer_role_key_for_device(device):
+    """
+    Infer a role key from device capabilities/model.
+    Supported keys: WIRELESS, LAN, GATEWAY, ROUTER, UNKNOWN.
+    """
+    if is_access_point_device(device):
+        return "WIRELESS"
+
+    features = get_device_features(device)
+    model = str(device.get("model", "")).upper()
+
+    if (
+        {"gateway", "securityGateway", "routing", "wan"} & features
+        or model.startswith(("USG", "UXG", "UDM", "UCG", "UDR", "UX", "UGW"))
+        or "GATEWAY" in model
+    ):
+        return "GATEWAY"
+
+    if "routing" in features or "ROUTER" in model:
+        return "ROUTER"
+
+    if {"switching", "switch", "ports"} & features:
+        return "LAN"
+
+    return "UNKNOWN"
+
+def select_netbox_role_for_device(device):
+    """
+    Pick a NetBox role object based on inferred role key and configured fallback order.
+    """
+    if not netbox_device_roles:
+        raise ValueError("No device roles loaded from NETBOX.ROLES")
+
+    inferred_key = infer_role_key_for_device(device)
+    if inferred_key in netbox_device_roles:
+        return netbox_device_roles[inferred_key], inferred_key
+
+    for fallback_key in ("LAN", "WIRELESS", "GATEWAY", "ROUTER", "UNKNOWN"):
+        if fallback_key in netbox_device_roles:
+            return netbox_device_roles[fallback_key], fallback_key
+
+    # Final fallback: first configured role
+    first_key = next(iter(netbox_device_roles))
+    return netbox_device_roles[first_key], first_key
+
 def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
     """Process a device and add it to NetBox."""
     try:
@@ -265,11 +322,9 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
         logger.info(f"Processing device {device_name} at site {site}...")
         logger.debug(f"Device details: Model={device_model}, MAC={device_mac}, IP={device_ip}, Serial={device_serial}")
 
-        # Determine device role
-        if is_access_point_device(device):
-            nb_device_role = wireless_role
-        else:
-            nb_device_role = lan_role
+        # Determine device role from configured NETBOX.ROLES mapping
+        nb_device_role, selected_role_key = select_netbox_role_for_device(device)
+        logger.debug(f"Using role '{selected_role_key}' ({nb_device_role.name}) for device {device_name}")
 
         if not device_serial:
             logger.warning(f"Missing serial/mac/id for device {device_name}. Skipping...")
@@ -706,29 +761,28 @@ if __name__ == "__main__":
 
     tenant = nb.tenancy.tenants.get(name=tenant_name)
 
-    try:
-        wireless_role_name = config['NETBOX']['ROLES']['WIRELESS']
-    except KeyError:
-        logger.exception("Netbox wireless role is missing from configuration.")
-        raise SystemExit(1)
-    try:
-        lan_role_name = config['NETBOX']['ROLES']['LAN']
-    except KeyError:
-        logger.exception("Netbox lan role is missing from configuration.")
+    roles_config = config.get('NETBOX', {}).get('ROLES')
+    if not isinstance(roles_config, dict) or not roles_config:
+        logger.exception("NETBOX.ROLES must be a non-empty mapping in config.")
         raise SystemExit(1)
 
-    wireless_role_slug = slugify(wireless_role_name)
-    lan_role_slug = slugify(lan_role_name)
-    wireless_role = nb.dcim.device_roles.get(slug=wireless_role_slug)
-    lan_role = nb.dcim.device_roles.get(slug=lan_role_slug)
-    if not wireless_role:
-        wireless_role = nb.dcim.device_roles.create({'name': wireless_role_name, 'slug': wireless_role_slug})
-        if wireless_role:
-            logger.info(f"Wireless role {wireless_role_name} with ID {wireless_role.id} successfully added to Netbox.")
-    if not lan_role:
-        lan_role = nb.dcim.device_roles.create({'name': lan_role_name, 'slug': lan_role_slug})
-        if lan_role:
-            logger.info(f"LAN role {lan_role_name} with ID {lan_role.id} successfully added to Netbox.")
+    netbox_device_roles.clear()
+    for role_key, role_name in roles_config.items():
+        if not role_name:
+            continue
+        normalized_key = str(role_key).upper()
+        role_slug = slugify(role_name)
+        role_obj = nb.dcim.device_roles.get(slug=role_slug)
+        if not role_obj:
+            role_obj = nb.dcim.device_roles.create({'name': role_name, 'slug': role_slug})
+            if role_obj:
+                logger.info(f"Role {normalized_key} ({role_name}) with ID {role_obj.id} successfully added to NetBox.")
+        if role_obj:
+            netbox_device_roles[normalized_key] = role_obj
+
+    if not netbox_device_roles:
+        logger.exception("Could not load or create any roles from NETBOX.ROLES.")
+        raise SystemExit(1)
 
     logger.debug("Fetching all NetBox sites")
     netbox_sites = nb.dcim.sites.all()

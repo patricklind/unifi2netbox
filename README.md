@@ -71,6 +71,9 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
      ROLES:
        WIRELESS: Wireless AP
        LAN: Switch
+       GATEWAY: Gateway Firewall
+       ROUTER: Router
+       UNKNOWN: Network Device
      TENANT: Organization Name
    ```
 
@@ -223,6 +226,16 @@ If you encounter issues with the integration:
    - The client supports Integration API v1 (`/proxy/network/integration/v1`) and also auto-detects UniFi OS (`/api/auth/login` with `/proxy/network`) and legacy controller (`/api/login`) session API styles.
 
 6. **Session issues**: If you encounter authentication problems, try deleting the session file and running again
+
+### Device Roles
+
+`NETBOX.ROLES` supports multiple role keys. The script will infer the best key per device and fall back automatically:
+
+- `WIRELESS`: access points
+- `LAN`: switches
+- `GATEWAY`: gateway/firewall devices (for example USG/UXG/UDM families)
+- `ROUTER`: routing-focused devices
+- `UNKNOWN`: fallback role when no specific match is found
 
 ### Handling Conflicts
 

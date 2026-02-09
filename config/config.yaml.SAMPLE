@@ -17,6 +17,9 @@ UNIFI:
 NETBOX:
   URL: http://localhost:8080
   ROLES:
-    WIRELESS: <name of wireless device role>
-    LAN: <name of switch role>
+    WIRELESS: Wireless AP
+    LAN: Switch
+    GATEWAY: Gateway Firewall
+    ROUTER: Router
+    UNKNOWN: Network Device
   TENANT: <name of tenant>
