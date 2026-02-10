@@ -556,6 +556,222 @@ def is_access_point_device(device):
         return "radios" in interfaces
     return False
 
+def map_unifi_port_to_netbox_type(port, api_style="integration"):
+    """Map a UniFi port dict to a NetBox interface type string."""
+    if api_style == "legacy":
+        media = (port.get("media") or "").upper()
+        speed = port.get("speed", 0) or 0
+        if media == "SFP+":
+            return "10gbase-x-sfpp"
+        if media == "SFP":
+            return "1000base-x-sfp"
+        if speed >= 10000:
+            return "10gbase-t"
+        if speed >= 2500:
+            return "2.5gbase-t"
+        return "1000base-t"
+    # Integration API
+    max_speed = port.get("maxSpeed") or port.get("speed") or 0
+    connector = (port.get("connector") or "").lower()
+    if "sfp" in connector:
+        if max_speed >= 10000:
+            return "10gbase-x-sfpp"
+        return "1000base-x-sfp"
+    if max_speed >= 10000:
+        return "10gbase-t"
+    if max_speed >= 2500:
+        return "2.5gbase-t"
+    return "1000base-t"
+
+
+def map_unifi_radio_to_netbox_type(radio):
+    """Map a UniFi radio to a NetBox wireless interface type."""
+    band = str(radio.get("band") or radio.get("radio") or "").lower()
+    if "6e" in band or "6ghz" in band or "6g" in band:
+        return "ieee802.11ax"
+    if "5g" in band or "na" in band:
+        return "ieee802.11ac"
+    if "2g" in band or "ng" in band:
+        return "ieee802.11n"
+    return "ieee802.11ax"
+
+
+def normalize_port_data(device, api_style="integration"):
+    """Extract and normalize port data from device dict into a common format."""
+    ports = []
+    if api_style == "integration":
+        raw_ports = (device.get("interfaces") or {}).get("ports") or []
+    else:
+        raw_ports = device.get("port_table") or []
+
+    for port in raw_ports:
+        if api_style == "integration":
+            name = port.get("name") or f"Port {port.get('portIdx', '?')}"
+            speed_mbps = port.get("maxSpeed") or port.get("speed") or 0
+            enabled = port.get("enabled", True) if "enabled" in port else port.get("up", True)
+            poe = port.get("poeMode") or port.get("poe_mode")
+            mac = port.get("macAddress") or port.get("mac")
+            is_uplink = port.get("isUplink", False)
+        else:
+            name = port.get("name") or f"Port {port.get('port_idx', '?')}"
+            speed_mbps = port.get("speed") or 0
+            enabled = port.get("up", True)
+            poe = port.get("poe_mode")
+            mac = port.get("mac")
+            is_uplink = port.get("is_uplink", False)
+
+        nb_type = map_unifi_port_to_netbox_type(port, api_style)
+        speed_kbps = int(speed_mbps) * 1000 if speed_mbps else None
+
+        nb_poe_mode = None
+        if poe:
+            poe_str = str(poe).lower()
+            if poe_str in ("auto", "pasv24", "passthrough", "on"):
+                nb_poe_mode = "pse"
+
+        ports.append({
+            "name": name,
+            "type": nb_type,
+            "speed_kbps": speed_kbps,
+            "enabled": bool(enabled),
+            "poe_mode": nb_poe_mode,
+            "mac_address": mac,
+            "is_uplink": bool(is_uplink),
+            "description": "Uplink" if is_uplink else "",
+        })
+    return ports
+
+
+def normalize_radio_data(device, api_style="integration"):
+    """Extract and normalize radio data from device dict."""
+    radios = []
+    if api_style == "integration":
+        raw_radios = (device.get("interfaces") or {}).get("radios") or []
+    else:
+        raw_radios = device.get("radio_table") or []
+
+    for radio in raw_radios:
+        name = radio.get("name") or f"radio{radio.get('radio', '?')}"
+        nb_type = map_unifi_radio_to_netbox_type(radio)
+        radios.append({
+            "name": name,
+            "type": nb_type,
+            "enabled": True,
+            "description": f"Channel {radio.get('channel')}" if radio.get("channel") else "",
+        })
+    return radios
+
+
+def sync_device_interfaces(nb, nb_device, device, api_style="integration"):
+    """
+    Sync physical port and radio interfaces from UniFi device data to NetBox.
+    Upsert: match by device_id + interface name, create if missing, update if changed.
+    """
+    if not os.getenv("SYNC_INTERFACES", "true").strip().lower() in ("true", "1", "yes"):
+        return
+
+    device_name = get_device_name(device)
+
+    # Fetch all existing interfaces for this device in one call
+    existing_interfaces = {
+        iface.name: iface
+        for iface in nb.dcim.interfaces.filter(device_id=nb_device.id)
+    }
+
+    # --- Physical Ports ---
+    ports = normalize_port_data(device, api_style)
+    for port in ports:
+        iface_name = port["name"]
+        existing = existing_interfaces.get(iface_name)
+
+        iface_data = {
+            "device": nb_device.id,
+            "name": iface_name,
+            "type": port["type"],
+            "enabled": port["enabled"],
+        }
+        if port.get("speed_kbps"):
+            iface_data["speed"] = port["speed_kbps"]
+        if port.get("poe_mode"):
+            iface_data["poe_mode"] = port["poe_mode"]
+        if port.get("description"):
+            iface_data["description"] = port["description"]
+        if port.get("mac_address"):
+            iface_data["mac_address"] = port["mac_address"]
+
+        if existing:
+            needs_update = False
+            for key, value in iface_data.items():
+                if key == "device":
+                    continue
+                current_val = getattr(existing, key, None)
+                if isinstance(current_val, dict):
+                    current_val = current_val.get("value")
+                if str(current_val) != str(value):
+                    needs_update = True
+                    break
+            if needs_update:
+                try:
+                    for key, value in iface_data.items():
+                        if key != "device":
+                            setattr(existing, key, value)
+                    existing.save()
+                    logger.debug(f"Updated interface {iface_name} on {device_name}")
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to update interface {iface_name} on {device_name}: {e}")
+        else:
+            try:
+                new_iface = nb.dcim.interfaces.create(iface_data)
+                if new_iface:
+                    logger.info(f"Created interface {iface_name} (ID {new_iface.id}) on {device_name}")
+            except pynetbox.core.query.RequestError as e:
+                logger.warning(f"Failed to create interface {iface_name} on {device_name}: {e}")
+
+    # --- Radio Interfaces (APs only) ---
+    if is_access_point_device(device):
+        radios = normalize_radio_data(device, api_style)
+        for radio in radios:
+            iface_name = radio["name"]
+            existing = existing_interfaces.get(iface_name)
+
+            iface_data = {
+                "device": nb_device.id,
+                "name": iface_name,
+                "type": radio["type"],
+                "enabled": radio["enabled"],
+            }
+            if radio.get("description"):
+                iface_data["description"] = radio["description"]
+
+            if existing:
+                needs_update = False
+                for key, value in iface_data.items():
+                    if key == "device":
+                        continue
+                    current_val = getattr(existing, key, None)
+                    if isinstance(current_val, dict):
+                        current_val = current_val.get("value")
+                    if str(current_val) != str(value):
+                        needs_update = True
+                        break
+                if needs_update:
+                    try:
+                        for key, value in iface_data.items():
+                            if key != "device":
+                                setattr(existing, key, value)
+                        existing.save()
+                        logger.debug(f"Updated radio {iface_name} on {device_name}")
+                    except pynetbox.core.query.RequestError as e:
+                        logger.warning(f"Failed to update radio {iface_name} on {device_name}: {e}")
+            else:
+                try:
+                    new_iface = nb.dcim.interfaces.create(iface_data)
+                    if new_iface:
+                        logger.info(f"Created radio {iface_name} (ID {new_iface.id}) on {device_name}")
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to create radio {iface_name} on {device_name}: {e}")
+
+
 def get_device_features(device):
     """Normalize feature information from legacy and integration payloads."""
     features = device.get("features")
@@ -738,6 +954,14 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                     nb_device.tags = current_tags
                     nb_device.save()
                     logger.info(f"Added 'zabbix' tag to device {device_name}.")
+
+        # Sync physical interfaces from UniFi to NetBox
+        if nb_device:
+            try:
+                api_style = getattr(unifi, "api_style", "legacy") or "legacy"
+                sync_device_interfaces(nb, nb_device, device, api_style)
+            except Exception as e:
+                logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
 
         # Add primary IP if available
         if not device_ip:
