@@ -114,41 +114,21 @@ def get_vrf_for_site(nb, site_name: str):
     if mode in {"none", "disabled", "off"}:
         return None, mode
 
-    # Prefer VRF name == site name (no prefix). Also try legacy "vrf_" prefix as fallback.
-    candidates = []
-    if site_name:
-        candidates.append(site_name)
-        if not site_name.lower().startswith("vrf_"):
-            candidates.append(f"vrf_{site_name}")
-    # De-dup
-    seen = set()
-    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+    # VRF name == site name (no prefix, no "vrf_").
+    if not site_name:
+        return None, mode
 
-    preferred_name = candidates[0] if candidates else None
     if mode in {"create", "site"}:
-        if not preferred_name:
-            return None, mode
-        vrf = get_or_create_vrf(nb, preferred_name)
+        vrf = get_or_create_vrf(nb, site_name)
         return vrf, mode
 
     if mode in {"existing", "get"}:
-        vrf = None
-        for name in candidates:
-            vrf = get_existing_vrf(nb, name)
-            if vrf:
-                if name.startswith("vrf_") and site_name and not site_name.lower().startswith("vrf_"):
-                    logger.warning(
-                        f"Using legacy VRF name '{name}'. Consider renaming it to '{site_name}'."
-                    )
-                return vrf, mode
+        vrf = get_existing_vrf(nb, site_name)
         return vrf, mode
 
     logger.warning(f"Unknown NETBOX_VRF_MODE='{mode}'. Falling back to 'existing'.")
-    for name in candidates:
-        vrf = get_existing_vrf(nb, name)
-        if vrf:
-            return vrf, "existing"
-    return None, "existing"
+    vrf = get_existing_vrf(nb, site_name)
+    return vrf, "existing"
 
 def get_postable_fields(base_url, token, url_path):
     """
@@ -798,7 +778,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                         "assigned_object_type": 'dcim.interface',
                         "address": ip,
                         "tenant_id": tenant.id,
-                        "status": "active",
+                        "status": "offline",
                     }
                     if vrf:
                         ip_payload["vrf_id"] = vrf.id
