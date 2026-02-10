@@ -666,64 +666,78 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
 
         # Check for existing device
         logger.debug(f"Checking if device already exists: {device_name} (serial: {device_serial})")
-        if nb.dcim.devices.get(site_id=site.id, serial=device_serial):
-            logger.info(f"Device {device_name} with serial {device_serial} already exists. Skipping...")
-            return
+        nb_device = nb.dcim.devices.get(site_id=site.id, serial=device_serial)
+        if nb_device:
+            logger.info(f"Device {device_name} with serial {device_serial} already exists. Checking IP...")
+        else:
+            # Create NetBox Device
+            try:
+                device_data = {
+                        'name': device_name,
+                        'device_type': nb_device_type.id,
+                        'tenant': tenant.id,
+                        'site': site.id,
+                        'serial': device_serial
+                    }
 
-        # Create NetBox Device
-        try:
-            device_data = {
-                    'name': device_name,
-                    'device_type': nb_device_type.id,
-                    'tenant': tenant.id,
-                    'site': site.id,
-                    'serial': device_serial
-                }
+                logger.debug(f"Getting postable fields for NetBox API")
+                available_fields = get_postable_fields(netbox_url, netbox_token, 'dcim/devices')
+                logger.debug(f"Available NetBox API fields: {list(available_fields.keys())}")
+                if 'role' in available_fields:
+                    logger.debug(f"Using 'role' field for device role (ID: {nb_device_role.id})")
+                    device_data['role'] = nb_device_role.id
+                elif 'device_role' in available_fields:
+                    logger.debug(f"Using 'device_role' field for device role (ID: {nb_device_role.id})")
+                    device_data['device_role'] = nb_device_role.id
+                else:
+                    logger.error(f'Could not determine the syntax for the role. Skipping device {device_name}, '
+                                    f'{device_serial}.')
+                    return None
 
-            logger.debug(f"Getting postable fields for NetBox API")
-            available_fields = get_postable_fields(netbox_url, netbox_token, 'dcim/devices')
-            logger.debug(f"Available NetBox API fields: {list(available_fields.keys())}")
-            if 'role' in available_fields:
-                logger.debug(f"Using 'role' field for device role (ID: {nb_device_role.id})")
-                device_data['role'] = nb_device_role.id
-            elif 'device_role' in available_fields:
-                logger.debug(f"Using 'device_role' field for device role (ID: {nb_device_role.id})")
-                device_data['device_role'] = nb_device_role.id
-            else:
-                logger.error(f'Could not determine the syntax for the role. Skipping device {device_name}, '
-                                f'{device_serial}.')
-                return None
+                # Device status on create (default: offline)
+                desired_status = (os.getenv("NETBOX_DEVICE_STATUS") or "offline").strip().lower()
+                if desired_status and "status" in available_fields:
+                    device_data["status"] = desired_status
 
-            # Device status on create (default: offline)
-            desired_status = (os.getenv("NETBOX_DEVICE_STATUS") or "offline").strip().lower()
-            if desired_status and "status" in available_fields:
-                device_data["status"] = desired_status
+                # Add the device to Netbox
+                logger.debug(f"Creating device in NetBox with data: {device_data}")
+                nb_device = nb.dcim.devices.create(device_data)
 
-            # Add the device to Netbox
-            logger.debug(f"Creating device in NetBox with data: {device_data}")
-            nb_device = nb.dcim.devices.create(device_data)
-
-            if nb_device:
-                logger.info(f"Device {device_name} serial {device_serial} with ID {nb_device.id} successfully added to NetBox.")
-        except pynetbox.core.query.RequestError as e:
-            error_message = str(e)
-            if "Device name must be unique per site" in error_message:
-                logger.warning(f"Device name {device_name} already exists at site {site}. "
-                               f"Trying with name {device_name}_{device_serial}.")
-                try:
-                    # Just update the name in the existing device_data dictionary
-                    device_data['name'] = f"{device_name}_{device_serial}"
-                    
-                    # Add the device to Netbox with updated name
-                    nb_device = nb.dcim.devices.create(device_data)
-                    if nb_device:
-                        logger.info(f"Device {device_name} with ID {nb_device.id} successfully added to NetBox.")
-                except pynetbox.core.query.RequestError as e2:
-                    logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e2}")
+                if nb_device:
+                    logger.info(f"Device {device_name} serial {device_serial} with ID {nb_device.id} successfully added to NetBox.")
+            except pynetbox.core.query.RequestError as e:
+                error_message = str(e)
+                if "Device name must be unique per site" in error_message:
+                    logger.warning(f"Device name {device_name} already exists at site {site}. "
+                                   f"Trying with name {device_name}_{device_serial}.")
+                    try:
+                        device_data['name'] = f"{device_name}_{device_serial}"
+                        nb_device = nb.dcim.devices.create(device_data)
+                        if nb_device:
+                            logger.info(f"Device {device_name} with ID {nb_device.id} successfully added to NetBox.")
+                    except pynetbox.core.query.RequestError as e2:
+                        logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e2}")
+                        return
+                else:
+                    logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e}")
                     return
-            else:
-                logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e}")
-                return
+
+        # Ensure "zabbix" tag is present on the device
+        if nb_device:
+            zabbix_tag = nb.extras.tags.get(slug="zabbix")
+            if not zabbix_tag:
+                try:
+                    zabbix_tag = nb.extras.tags.create({"name": "zabbix", "slug": "zabbix"})
+                    logger.info(f"Created tag 'zabbix' in NetBox (ID {zabbix_tag.id}).")
+                except pynetbox.core.query.RequestError:
+                    zabbix_tag = nb.extras.tags.get(slug="zabbix")
+            if zabbix_tag:
+                current_tags = [t.id for t in (nb_device.tags or [])]
+                if zabbix_tag.id not in current_tags:
+                    current_tags.append(zabbix_tag.id)
+                    nb_device.tags = current_tags
+                    nb_device.save()
+                    logger.info(f"Added 'zabbix' tag to device {device_name}.")
 
         # Add primary IP if available
         if not device_ip:
@@ -748,6 +762,26 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             ip = f'{device_ip}/{subnet_mask}'
             break
         if nb_device:
+            # Check if the IP has changed compared to what NetBox has
+            old_ip_str = None
+            if nb_device.primary_ip4:
+                old_ip_obj = nb.ipam.ip_addresses.get(id=nb_device.primary_ip4.id)
+                if old_ip_obj:
+                    old_ip_str = str(old_ip_obj.address).split("/")[0]
+            if old_ip_str and old_ip_str != device_ip:
+                logger.info(f"Device {device_name} IP changed: {old_ip_str} -> {device_ip}. Updating NetBox.")
+                # Remove old IP assignment
+                try:
+                    old_ip_obj.delete()
+                    logger.info(f"Deleted old IP {old_ip_str} for device {device_name}.")
+                except Exception as e:
+                    logger.warning(f"Could not delete old IP {old_ip_str} for device {device_name}: {e}")
+                nb_device.primary_ip4 = None
+                nb_device.save()
+            elif old_ip_str and old_ip_str == device_ip:
+                logger.debug(f"Device {device_name} IP unchanged ({device_ip}). Skipping IP update.")
+                return
+
             interface = nb.dcim.interfaces.get(device_id=nb_device.id, name="vlan.1")
             if not interface:
                 try:
@@ -791,7 +825,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             if nb_ip:
                 nb_device.primary_ip4 = nb_ip.id
                 nb_device.save()
-                logger.info(f"Device {device_name} with IP {ip} added to NetBox.")
+                logger.info(f"Device {device_name} primary IP set to {ip}.")
 
     except Exception as e:
         logger.exception(f"Failed to process device {get_device_name(device)} at site {site}: {e}")
