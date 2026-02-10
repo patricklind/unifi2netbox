@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 from slugify import slugify
 import os
 import re
-import sys
 import requests
 import warnings
 import logging
@@ -25,7 +24,6 @@ logger = logging.getLogger(__name__)
 MAX_CONTROLLER_THREADS = 5  # Number of UniFi controllers to process concurrently
 MAX_SITE_THREADS = 8  # Number of sites to process concurrently per controller
 MAX_DEVICE_THREADS = 8  # Number of devices to process concurrently per site
-MAX_THREADS = 8 # Define threads based on available system cores or default
 
 # Populated at runtime from NETBOX roles in env/config
 netbox_device_roles = {}
@@ -773,102 +771,6 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
             except Exception as e:
                 logger.exception(f"Error processing one of the UniFi controllers {url}: {e}")
                 continue
-
-def fetch_site_devices(unifi, site_name):
-    """Fetch devices for a specific site."""
-    logger.info(f"Fetching devices for site {site_name}...")
-    try:
-        logger.debug(f"Getting site object for: {site_name}")
-        site = unifi.site(site_name)
-        if site:
-            logger.debug(f"Retrieving devices for site: {site_name}")
-            devices = site.device.all()
-            logger.debug(f"Retrieved {len(devices)} devices for site: {site_name}")
-            return devices
-        else:
-            logger.error(f"Site {site_name} not found")
-            return None
-    except Exception as e:
-        logger.error(f"Failed to fetch devices for site {site_name}: {e}")
-        return None
-
-def process_all_sites(unifi, netbox_sites_dict, nb, nb_ubiquity, tenant):
-    """Process all sites and their devices concurrently."""
-    # Get all sites from the unifi module
-    unifi_sites = unifi.sites
-    if not unifi_sites:
-        logger.error("Failed to fetch sites from UniFi controller.")
-        return
-
-    sites = {}
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        # Fetch all devices per site concurrently
-        future_to_site = {executor.submit(fetch_site_devices, unifi, site_name): site_name for site_name in unifi_sites.keys()}
-        for future in as_completed(future_to_site):
-            site_name = future_to_site[future]
-            try:
-                devices = future.result()
-                if devices:
-                    sites[site_name] = devices
-                    logger.info(f"Successfully fetched devices for site {site_name}")
-            except Exception as e:
-                logger.error(f"Error fetching devices for site {site_name}: {e}")
-
-    logger.info(f"Fetched {len(sites)} sites. Starting device processing...")
-
-    # Process devices in parallel
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        future_to_device = {}
-        for site_name, devices in sites.items():
-            # Use the site mapping to find the corresponding NetBox site
-            nb_site = match_sites_to_netbox(site_name, netbox_sites_dict)
-            if not nb_site:
-                logger.warning(f"No matching NetBox site found for Ubiquity site {site_name}. Add mapping in site_mapping.yaml. Skipping...")
-                continue
-            for device in devices:
-                future = executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant)
-                future_to_device[future] = (site_name, device)
-
-        for future in as_completed(future_to_device):
-            site_name, device = future_to_device[future]
-            try:
-                future.result()
-                logger.info(f"Successfully processed device {device['name']} at site {site_name}.")
-            except Exception as e:
-                logger.error(f"Error processing device {device['name']} at site {site_name}: {e}")
-
-def parse_successful_log_entries(log_file):
-    """
-    Parses a log file to find entries containing 'successfully added to NetBox'
-    and builds a dictionary with 'device' and 'ip address' lists of IDs.
-
-    :param log_file: Path to the log file
-    :return: Dictionary with lists of IDs for 'device' and 'ip address'
-    """
-    # Dictionary to store the resulting lists
-    result = {
-        "device": [],
-        "ip address": []
-    }
-
-    # Regular expression to extract the ID from the log entry
-    id_pattern_device = re.compile(r"^Device .* with ID (\d+) successfully added to NetBox")
-    id_pattern_ip = re.compile(r"^IP address .* with ID (\d+) successfully added to NetBox")
-
-    with open(log_file, "r") as file:
-        for line in file:
-            # Start processing the log entry only after `INFO -`
-            if "INFO - " in line:
-                log_content = line.split("INFO - ", 1)[1]  # Extract the part after "INFO - "
-
-                # Match and classify the log entry
-                if match := id_pattern_device.match(log_content):
-                    result["device"].append(int(match.group(1)))  # Extract and add device ID
-                elif match := id_pattern_ip.match(log_content):
-                    result["ip address"].append(int(match.group(1)))  # Extract and add IP address ID
-
-    return result
-
 
 if __name__ == "__main__":
     # Parse command line arguments

@@ -4,3 +4,7 @@
 logs/*
 config/config.yaml
 config.yaml
+__pycache__/
+*.py[cod]
+.idea/
+.DS_Store
