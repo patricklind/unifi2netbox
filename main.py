@@ -726,6 +726,16 @@ def get_device_name(device):
         or "unknown-device"
     )
 
+def extract_asset_tag(device_name):
+    """Extract ID or AID tag from device name, e.g. 'IT-AULA-AP02-ID3006' -> 'ID3006'."""
+    if not device_name:
+        return None
+    match = re.search(r'[-_]?(A?ID\d+)$', device_name, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
 def get_device_mac(device):
     return device.get("mac") or device.get("macAddress")
 
@@ -1231,6 +1241,10 @@ def normalize_port_data(device, api_style="integration"):
             mac = port.get("mac")
             is_uplink = port.get("is_uplink", False)
 
+        # Skip ports without real data (missing index/name)
+        if "?" in name:
+            continue
+
         nb_type = map_unifi_port_to_netbox_type(port, api_style)
         speed_kbps = int(speed_mbps) * 1000 if speed_mbps else None
 
@@ -1280,6 +1294,9 @@ def normalize_radio_data(device, api_style="integration"):
 
     for radio in raw_radios:
         name = radio.get("name") or f"radio{radio.get('radio', '?')}"
+        # Skip radios without real data (missing index/name)
+        if "?" in name:
+            continue
         nb_type = map_unifi_radio_to_netbox_type(radio)
         radios.append({
             "name": name,
@@ -1299,12 +1316,22 @@ def _fetch_integration_device_detail(unifi, site_obj, device_id):
         logger.debug(f"Device detail response type: {type(response)}, "
                      f"keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
         if isinstance(response, dict):
+            # Detect error responses from the API
+            if "statusCode" in response:
+                status = int(response.get("statusCode", 0))
+                if status >= 400:
+                    logger.debug(f"Device detail API error for {device_id}: "
+                                 f"{response.get('message', 'unknown error')} (status {status})")
+                    return None
             data = response.get("data", response)
             if isinstance(data, dict):
+                # Also check if data itself is an error response
+                if "statusCode" in data and int(data.get("statusCode", 0)) >= 400:
+                    return None
                 return data
             if isinstance(data, list) and data:
                 return data[0]
-        return response if isinstance(response, dict) else None
+        return None
     except Exception as e:
         logger.debug(f"Could not fetch device detail for {device_id}: {e}")
     return None
@@ -1448,6 +1475,15 @@ def sync_device_interfaces(nb, nb_device, device, api_style="integration", unifi
                 except pynetbox.core.query.RequestError as e:
                     logger.warning(f"Failed to create radio {iface_name} on {device_name}: {e}")
 
+    # Clean up interfaces with '?' in name (leftover from previous runs with missing data)
+    for iface_name, iface_obj in existing_interfaces.items():
+        if "?" in iface_name:
+            try:
+                iface_obj.delete()
+                logger.info(f"Deleted invalid interface '{iface_name}' from {device_name}")
+            except Exception as e:
+                logger.warning(f"Failed to delete interface '{iface_name}' from {device_name}: {e}")
+
 
 def get_device_features(device):
     """Normalize feature information from legacy and integration payloads."""
@@ -1568,6 +1604,34 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         nb_device = nb.dcim.devices.get(site_id=site.id, serial=device_serial)
         if nb_device:
             logger.info(f"Device {device_name} with serial {device_serial} already exists. Checking IP...")
+            # Update device name if changed in UniFi
+            if nb_device.name != device_name:
+                old_name = nb_device.name
+                nb_device.name = device_name
+                try:
+                    nb_device.save()
+                    logger.info(f"Updated device name from '{old_name}' to '{device_name}'")
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to update device name to '{device_name}': {e}")
+                    nb_device.name = old_name  # Revert on failure
+            # Update device type if model changed
+            current_type_id = nb_device.device_type.id if nb_device.device_type else None
+            if nb_device_type and current_type_id != nb_device_type.id:
+                nb_device.device_type = nb_device_type.id
+                try:
+                    nb_device.save()
+                    logger.info(f"Updated device type for {device_name} to {device_model}")
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to update device type for {device_name}: {e}")
+            # Update asset tag from device name (ID/AID suffix)
+            asset_tag = extract_asset_tag(device_name)
+            if asset_tag and getattr(nb_device, 'asset_tag', None) != asset_tag:
+                nb_device.asset_tag = asset_tag
+                try:
+                    nb_device.save()
+                    logger.info(f"Updated asset tag for {device_name} to {asset_tag}")
+                except pynetbox.core.query.RequestError as e:
+                    logger.warning(f"Failed to update asset tag for {device_name}: {e}")
         else:
             # Create NetBox Device
             try:
@@ -1578,6 +1642,9 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                         'site': site.id,
                         'serial': device_serial
                     }
+                asset_tag = extract_asset_tag(device_name)
+                if asset_tag:
+                    device_data['asset_tag'] = asset_tag
 
                 logger.debug(f"Getting postable fields for NetBox API")
                 available_fields = get_postable_fields(netbox_url, netbox_token, 'dcim/devices')
@@ -1651,7 +1718,12 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
             except Exception as e:
                 logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
 
-        # Add primary IP if available
+        # Add primary IP if available — skip routers/gateways (they manage their own IPs)
+        role_key = infer_role_key_for_device(device)
+        if role_key in ("GATEWAY", "ROUTER"):
+            logger.debug(f"Skipping IP assignment for {device_name} — device is a {role_key}")
+            return
+
         if not device_ip:
             logger.warning(f"Missing IP for device {device_name}. Skipping IP assignment...")
             return
