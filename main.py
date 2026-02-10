@@ -132,10 +132,11 @@ def get_vrf_for_site(nb, site_name: str):
         return vrf, mode
 
     if mode in {"existing", "get"}:
+        vrf = None
         for name in candidates:
             vrf = get_existing_vrf(nb, name)
             if vrf:
-                if name.startswith("vrf_") and name != (site_name or ""):
+                if name.startswith("vrf_") and site_name and not site_name.lower().startswith("vrf_"):
                     logger.warning(
                         f"Using legacy VRF name '{name}'. Consider renaming it to '{site_name}'."
                     )
