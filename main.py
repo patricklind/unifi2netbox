@@ -1121,10 +1121,15 @@ def sync_site_wlans(nb, site_obj, nb_site, tenant):
         else:
             auth_type = "wpa-personal"
 
-        # Check if wireless LAN exists
+        # Check if wireless LAN exists for this group (site)
         existing = None
         try:
-            existing = nb.wireless.wireless_lans.get(ssid=ssid)
+            filters = {"ssid": ssid}
+            if wlan_group:
+                filters["group_id"] = wlan_group.id
+            matches = list(nb.wireless.wireless_lans.filter(**filters))
+            if matches:
+                existing = matches[0]
         except Exception:
             pass
 
