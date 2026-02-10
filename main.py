@@ -558,10 +558,19 @@ def is_access_point_device(device):
     if isinstance(features, dict):
         return "accessPoint" in features
     interfaces = device.get("interfaces")
-    if isinstance(interfaces, list):
-        return "radios" in interfaces
     if isinstance(interfaces, dict):
-        return "radios" in interfaces
+        return bool(interfaces.get("radios"))
+    if isinstance(interfaces, list):
+        # Check if any item in the list looks like a radio
+        return any(
+            isinstance(iface, dict) and (
+                iface.get("radio") is not None
+                or iface.get("band")
+                or iface.get("channel")
+                or (iface.get("name") or "").lower().startswith("radio")
+            )
+            for iface in interfaces
+        )
     return False
 
 def ensure_custom_field(nb, name, cf_type="text", content_types=None, label=None):
@@ -964,7 +973,24 @@ def normalize_port_data(device, api_style="integration"):
     """Extract and normalize port data from device dict into a common format."""
     ports = []
     if api_style == "integration":
-        raw_ports = (device.get("interfaces") or {}).get("ports") or []
+        interfaces = device.get("interfaces")
+        if isinstance(interfaces, dict):
+            raw_ports = interfaces.get("ports") or []
+        elif isinstance(interfaces, list):
+            # Integration API v1 may return interfaces as a flat list;
+            # filter to port-type entries (non-radio, or entries with portIdx/connector)
+            raw_ports = [
+                iface for iface in interfaces
+                if isinstance(iface, dict) and (
+                    iface.get("portIdx") is not None
+                    or iface.get("connector")
+                    or iface.get("maxSpeed")
+                    or iface.get("type", "").lower() in ("ethernet", "sfp", "sfp+", "port")
+                    or (iface.get("name") or "").lower().startswith("port")
+                )
+            ]
+        else:
+            raw_ports = []
     else:
         raw_ports = device.get("port_table") or []
 
@@ -1010,7 +1036,24 @@ def normalize_radio_data(device, api_style="integration"):
     """Extract and normalize radio data from device dict."""
     radios = []
     if api_style == "integration":
-        raw_radios = (device.get("interfaces") or {}).get("radios") or []
+        interfaces = device.get("interfaces")
+        if isinstance(interfaces, dict):
+            raw_radios = interfaces.get("radios") or []
+        elif isinstance(interfaces, list):
+            # Integration API v1 may return interfaces as a flat list;
+            # filter to radio-type entries
+            raw_radios = [
+                iface for iface in interfaces
+                if isinstance(iface, dict) and (
+                    iface.get("radio") is not None
+                    or iface.get("band")
+                    or iface.get("channel")
+                    or iface.get("type", "").lower() in ("radio", "wireless")
+                    or (iface.get("name") or "").lower().startswith("radio")
+                )
+            ]
+        else:
+            raw_radios = []
     else:
         raw_radios = device.get("radio_table") or []
 
@@ -1026,7 +1069,27 @@ def normalize_radio_data(device, api_style="integration"):
     return radios
 
 
-def sync_device_interfaces(nb, nb_device, device, api_style="integration"):
+def _fetch_integration_device_detail(unifi, site_obj, device_id):
+    """Fetch full device detail via Integration API /devices/{id} which includes port_table."""
+    try:
+        site_api_id = getattr(site_obj, "api_id", site_obj.name)
+        url = f"/sites/{site_api_id}/devices/{device_id}"
+        response = unifi.make_request(url, "GET")
+        logger.debug(f"Device detail response type: {type(response)}, "
+                     f"keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+        if isinstance(response, dict):
+            data = response.get("data", response)
+            if isinstance(data, dict):
+                return data
+            if isinstance(data, list) and data:
+                return data[0]
+        return response if isinstance(response, dict) else None
+    except Exception as e:
+        logger.debug(f"Could not fetch device detail for {device_id}: {e}")
+    return None
+
+
+def sync_device_interfaces(nb, nb_device, device, api_style="integration", unifi=None, site_obj=None):
     """
     Sync physical port and radio interfaces from UniFi device data to NetBox.
     Upsert: match by device_id + interface name, create if missing, update if changed.
@@ -1035,6 +1098,35 @@ def sync_device_interfaces(nb, nb_device, device, api_style="integration"):
         return
 
     device_name = get_device_name(device)
+
+    # Integration API v1: device list only returns interfaces: ["ports"]/["radios"]
+    # as metadata strings. We need to fetch actual port data via a separate API call.
+    interfaces = device.get("interfaces")
+    if api_style == "integration" and isinstance(interfaces, list) and unifi and site_obj:
+        device_id = device.get("id")
+        if device_id:
+            detail = _fetch_integration_device_detail(unifi, site_obj, device_id)
+            if detail and isinstance(detail, dict):
+                detail_ifaces = detail.get("interfaces")
+                port_table = detail.get("port_table")
+                radio_table = detail.get("radio_table")
+                logger.debug(f"Device {device_name} detail: interfaces type={type(detail_ifaces)}, "
+                             f"has port_table={port_table is not None}, has radio_table={radio_table is not None}, "
+                             f"detail keys={list(detail.keys())[:15]}")
+                # If the detail has richer interface data, use it
+                if isinstance(detail_ifaces, dict):
+                    device = dict(device)
+                    device["interfaces"] = detail_ifaces
+                elif port_table or radio_table:
+                    device = dict(device)
+                    if port_table:
+                        device["port_table"] = port_table
+                    if radio_table:
+                        device["radio_table"] = radio_table
+                    # Switch to legacy-style parsing since we have port_table/radio_table
+                    api_style = "legacy"
+            else:
+                logger.debug(f"No detail data returned for {device_name} from Integration API")
 
     # Fetch all existing interfaces for this device in one call
     existing_interfaces = {
@@ -1328,7 +1420,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             # Sync physical interfaces from UniFi to NetBox
             try:
                 api_style = getattr(unifi, "api_style", "legacy") or "legacy"
-                sync_device_interfaces(nb, nb_device, device, api_style)
+                sync_device_interfaces(nb, nb_device, device, api_style, unifi=unifi, site_obj=site)
             except Exception as e:
                 logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
 
