@@ -33,6 +33,14 @@ vrf_cache = {}
 vrf_cache_lock = threading.Lock()
 vrf_locks = {}
 vrf_locks_lock = threading.Lock()
+# Caches for custom fields, tags, VLANs (thread-safe)
+_custom_field_cache = {}
+_custom_field_lock = threading.Lock()
+_tag_cache = {}
+_tag_lock = threading.Lock()
+_vlan_cache = {}
+_vlan_lock = threading.Lock()
+_cable_lock = threading.Lock()
 
 
 def _get_vrf_lock(vrf_name: str) -> threading.Lock:
@@ -556,6 +564,362 @@ def is_access_point_device(device):
         return "radios" in interfaces
     return False
 
+def ensure_custom_field(nb, name, cf_type="text", content_types=None, label=None):
+    """Ensure a custom field exists in NetBox. Create if missing. Returns the CF object."""
+    with _custom_field_lock:
+        if name in _custom_field_cache:
+            return _custom_field_cache[name]
+    cf = None
+    try:
+        cfs = list(nb.extras.custom_fields.filter(name=name))
+        if cfs:
+            cf = cfs[0]
+        else:
+            cf = nb.extras.custom_fields.create({
+                "name": name,
+                "type": cf_type,
+                "content_types": content_types or ["dcim.device"],
+                "label": label or name.replace("_", " ").title(),
+                "filter_logic": "loose",
+            })
+            if cf:
+                logger.info(f"Created custom field '{name}' in NetBox.")
+    except Exception as e:
+        logger.warning(f"Could not ensure custom field '{name}': {e}")
+    with _custom_field_lock:
+        _custom_field_cache[name] = cf
+    return cf
+
+
+def ensure_tag(nb, name, slug=None, color=None):
+    """Ensure a tag exists in NetBox. Returns the tag object."""
+    slug = slug or slugify(name)
+    with _tag_lock:
+        if slug in _tag_cache:
+            return _tag_cache[slug]
+    tag = None
+    try:
+        tag = nb.extras.tags.get(slug=slug)
+        if not tag:
+            payload = {"name": name, "slug": slug}
+            if color:
+                payload["color"] = color
+            tag = nb.extras.tags.create(payload)
+            if tag:
+                logger.info(f"Created tag '{name}' in NetBox.")
+    except pynetbox.core.query.RequestError:
+        tag = nb.extras.tags.get(slug=slug)
+    with _tag_lock:
+        _tag_cache[slug] = tag
+    return tag
+
+
+def sync_device_state(nb, nb_device, device):
+    """Sync UniFi device state to NetBox device status (active/offline)."""
+    state = (device.get("state") or device.get("status") or "").upper()
+    if state in ("ONLINE", "CONNECTED", "1"):
+        desired = "active"
+    elif state in ("OFFLINE", "DISCONNECTED", "0"):
+        desired = "offline"
+    else:
+        return  # Unknown state, don't change
+
+    current = None
+    if nb_device.status:
+        current = nb_device.status.value if isinstance(nb_device.status, dict) or hasattr(nb_device.status, 'value') else str(nb_device.status)
+        if hasattr(nb_device.status, 'value'):
+            current = nb_device.status.value
+    if current != desired:
+        nb_device.status = desired
+        nb_device.save()
+        logger.info(f"Updated {nb_device.name} status: {current} -> {desired}")
+
+
+def sync_device_custom_fields(nb, nb_device, device):
+    """Sync firmware version and uptime from UniFi to NetBox custom fields."""
+    # Ensure custom fields exist
+    ensure_custom_field(nb, "unifi_firmware", cf_type="text", label="UniFi Firmware")
+    ensure_custom_field(nb, "unifi_uptime", cf_type="integer", label="UniFi Uptime (sec)")
+    ensure_custom_field(nb, "unifi_mac", cf_type="text", label="UniFi MAC")
+
+    firmware = device.get("firmwareVersion") or device.get("version") or device.get("fw_version")
+    uptime = device.get("uptimeSec") or device.get("uptime") or device.get("_uptime")
+    mac = device.get("macAddress") or device.get("mac")
+
+    cf = dict(nb_device.custom_fields or {})
+    changed = False
+
+    if firmware and cf.get("unifi_firmware") != firmware:
+        cf["unifi_firmware"] = firmware
+        changed = True
+    if uptime is not None:
+        try:
+            uptime_int = int(uptime)
+            if cf.get("unifi_uptime") != uptime_int:
+                cf["unifi_uptime"] = uptime_int
+                changed = True
+        except (ValueError, TypeError):
+            pass
+    if mac and cf.get("unifi_mac") != mac:
+        cf["unifi_mac"] = mac
+        changed = True
+
+    if changed:
+        nb_device.custom_fields = cf
+        nb_device.save()
+        logger.debug(f"Updated custom fields for {nb_device.name}")
+
+
+def sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac):
+    """Create cable between device uplink port and upstream device if both exist in NetBox."""
+    # Integration API: uplink.deviceId; Legacy: uplink_mac or uplink.mac
+    uplink = device.get("uplink") or {}
+    upstream_device_id = uplink.get("deviceId") or uplink.get("device_id")
+    upstream_mac = uplink.get("uplink_mac") or uplink.get("mac")
+    uplink_port_name = uplink.get("name") or uplink.get("uplink_port") or uplink.get("port_name")
+
+    if not upstream_device_id and not upstream_mac:
+        return
+
+    # Find upstream device in NetBox
+    upstream_nb = None
+    if upstream_mac:
+        normalized_mac = upstream_mac.upper().replace(":", "")
+        upstream_nb = all_nb_devices_by_mac.get(normalized_mac)
+    # If not found by MAC, try by looking up serial (for integration API deviceId is UUID)
+    if not upstream_nb and upstream_device_id:
+        # The upstream_device_id might be in our devices cache
+        for mac_key, dev in all_nb_devices_by_mac.items():
+            if str(getattr(dev, 'serial', '')) == str(upstream_device_id):
+                upstream_nb = dev
+                break
+
+    if not upstream_nb:
+        return
+
+    # Find the uplink interface on our device
+    device_name = get_device_name(device)
+    our_iface = None
+    if uplink_port_name:
+        our_iface = nb.dcim.interfaces.get(device_id=nb_device.id, name=uplink_port_name)
+    if not our_iface:
+        # Try to find any interface marked as uplink
+        all_ifaces = nb.dcim.interfaces.filter(device_id=nb_device.id)
+        for iface in all_ifaces:
+            if iface.description and "uplink" in iface.description.lower():
+                our_iface = iface
+                break
+
+    if not our_iface:
+        return
+
+    # Check if cable already exists on this interface
+    if our_iface.cable:
+        return  # Cable already connected
+
+    # Find a port on upstream device to connect to (prefer matching name)
+    upstream_iface = None
+    upstream_ifaces = list(nb.dcim.interfaces.filter(device_id=upstream_nb.id))
+    for iface in upstream_ifaces:
+        if not iface.cable:  # Find an unconnected port
+            upstream_iface = iface
+            break
+
+    if not upstream_iface:
+        return
+
+    with _cable_lock:
+        try:
+            cable = nb.dcim.cables.create({
+                "a_terminations": [{"object_type": "dcim.interface", "object_id": our_iface.id}],
+                "b_terminations": [{"object_type": "dcim.interface", "object_id": upstream_iface.id}],
+                "status": "connected",
+            })
+            if cable:
+                logger.info(f"Created cable: {device_name}:{our_iface.name} <-> {upstream_nb.name}:{upstream_iface.name}")
+        except pynetbox.core.query.RequestError as e:
+            logger.debug(f"Could not create cable for {device_name}: {e}")
+
+
+def sync_site_vlans(nb, site_obj, nb_site, tenant):
+    """Sync VLANs from UniFi network configs to NetBox."""
+    try:
+        networks = site_obj.network_conf.all()
+    except Exception as e:
+        logger.warning(f"Could not fetch networks for site {nb_site.name}: {e}")
+        return
+
+    if not networks:
+        return
+
+    # Ensure a VLAN group exists for the site
+    vlan_group = None
+    try:
+        vlan_group = nb.ipam.vlan_groups.get(slug=slugify(nb_site.name))
+        if not vlan_group:
+            vlan_group = nb.ipam.vlan_groups.create({
+                "name": nb_site.name,
+                "slug": slugify(nb_site.name),
+                "scope_type": "dcim.site",
+                "scope_id": nb_site.id,
+            })
+            if vlan_group:
+                logger.info(f"Created VLAN group '{nb_site.name}' for site.")
+    except pynetbox.core.query.RequestError as e:
+        logger.warning(f"Could not create VLAN group for {nb_site.name}: {e}")
+        # Try without scope (older NetBox)
+        try:
+            vlan_group = nb.ipam.vlan_groups.get(slug=slugify(nb_site.name))
+            if not vlan_group:
+                vlan_group = nb.ipam.vlan_groups.create({
+                    "name": nb_site.name,
+                    "slug": slugify(nb_site.name),
+                })
+        except Exception:
+            pass
+
+    for net in networks:
+        vlan_id = net.get("vlanId") or net.get("vlan") or net.get("vlan_id")
+        net_name = net.get("name") or net.get("purpose") or "Unknown"
+        enabled = net.get("enabled", True)
+
+        if not vlan_id:
+            continue
+
+        try:
+            vlan_id = int(vlan_id)
+        except (ValueError, TypeError):
+            continue
+
+        vlan_key = f"{nb_site.id}_{vlan_id}"
+        with _vlan_lock:
+            if vlan_key in _vlan_cache:
+                continue
+
+        # Check if VLAN exists
+        vlan_filters = {"vid": vlan_id, "site_id": nb_site.id}
+        existing = nb.ipam.vlans.get(**vlan_filters)
+        if not existing and vlan_group:
+            vlan_filters = {"vid": vlan_id, "group_id": vlan_group.id}
+            existing = nb.ipam.vlans.get(**vlan_filters)
+
+        if not existing:
+            try:
+                vlan_payload = {
+                    "name": net_name,
+                    "vid": vlan_id,
+                    "site": nb_site.id,
+                    "tenant": tenant.id,
+                    "status": "active" if enabled else "reserved",
+                }
+                if vlan_group:
+                    vlan_payload["group"] = vlan_group.id
+                new_vlan = nb.ipam.vlans.create(vlan_payload)
+                if new_vlan:
+                    logger.info(f"Created VLAN {vlan_id} ({net_name}) at site {nb_site.name}")
+                    with _vlan_lock:
+                        _vlan_cache[vlan_key] = new_vlan
+            except pynetbox.core.query.RequestError as e:
+                logger.warning(f"Could not create VLAN {vlan_id} ({net_name}): {e}")
+        else:
+            with _vlan_lock:
+                _vlan_cache[vlan_key] = existing
+            # Update name if changed
+            if existing.name != net_name:
+                try:
+                    existing.name = net_name
+                    existing.save()
+                    logger.debug(f"Updated VLAN {vlan_id} name to '{net_name}'")
+                except Exception:
+                    pass
+
+
+def sync_site_wlans(nb, site_obj, nb_site, tenant):
+    """Sync WiFi SSIDs from UniFi to NetBox wireless LANs."""
+    try:
+        wlans = site_obj.wlan_conf.all()
+    except Exception as e:
+        logger.warning(f"Could not fetch WLANs for site {nb_site.name}: {e}")
+        return
+
+    if not wlans:
+        return
+
+    # Ensure a wireless LAN group for the site
+    wlan_group = None
+    try:
+        wlan_group = nb.wireless.wireless_lan_groups.get(slug=slugify(nb_site.name))
+        if not wlan_group:
+            wlan_group = nb.wireless.wireless_lan_groups.create({
+                "name": nb_site.name,
+                "slug": slugify(nb_site.name),
+            })
+            if wlan_group:
+                logger.info(f"Created wireless LAN group '{nb_site.name}'.")
+    except Exception as e:
+        logger.debug(f"Wireless LAN groups not available: {e}")
+
+    for wlan in wlans:
+        ssid = wlan.get("name") or wlan.get("x_passphrase") or "Unknown"
+        enabled = wlan.get("enabled", True)
+        security = wlan.get("security") or wlan.get("wpa_mode") or ""
+        # Integration API: securityConfiguration.type
+        sec_config = wlan.get("securityConfiguration") or {}
+        if isinstance(sec_config, dict):
+            security = security or sec_config.get("type") or ""
+
+        # Map security to NetBox auth_type
+        sec_lower = str(security).lower()
+        if "wpa3" in sec_lower or "sae" in sec_lower:
+            auth_type = "wpa3-personal"
+        elif "wpa2" in sec_lower or "wpa" in sec_lower:
+            auth_type = "wpa2-personal"
+        elif "enterprise" in sec_lower:
+            auth_type = "wpa2-enterprise"
+        elif "open" in sec_lower:
+            auth_type = "open"
+        else:
+            auth_type = "wpa2-personal"
+
+        # Check if wireless LAN exists
+        existing = None
+        try:
+            existing = nb.wireless.wireless_lans.get(ssid=ssid)
+        except Exception:
+            pass
+
+        if not existing:
+            try:
+                wlan_payload = {
+                    "ssid": ssid,
+                    "status": "active" if enabled else "disabled",
+                    "auth_type": auth_type,
+                    "tenant": tenant.id,
+                }
+                if wlan_group:
+                    wlan_payload["group"] = wlan_group.id
+                new_wlan = nb.wireless.wireless_lans.create(wlan_payload)
+                if new_wlan:
+                    logger.info(f"Created wireless LAN '{ssid}' at site {nb_site.name}")
+            except pynetbox.core.query.RequestError as e:
+                logger.warning(f"Could not create wireless LAN '{ssid}': {e}")
+        else:
+            # Update if changed
+            changed = False
+            desired_status = "active" if enabled else "disabled"
+            if hasattr(existing, 'status') and existing.status:
+                current_status = existing.status.value if hasattr(existing.status, 'value') else str(existing.status)
+                if current_status != desired_status:
+                    existing.status = desired_status
+                    changed = True
+            if changed:
+                try:
+                    existing.save()
+                    logger.debug(f"Updated wireless LAN '{ssid}'")
+                except Exception:
+                    pass
+
+
 def map_unifi_port_to_netbox_type(port, api_style="integration"):
     """Map a UniFi port dict to a NetBox interface type string."""
     if api_style == "legacy":
@@ -938,15 +1302,9 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                     logger.exception(f"Failed to create device {device_name} serial {device_serial} at site {site}: {e}")
                     return
 
-        # Ensure "zabbix" tag is present on the device
         if nb_device:
-            zabbix_tag = nb.extras.tags.get(slug="zabbix")
-            if not zabbix_tag:
-                try:
-                    zabbix_tag = nb.extras.tags.create({"name": "zabbix", "slug": "zabbix"})
-                    logger.info(f"Created tag 'zabbix' in NetBox (ID {zabbix_tag.id}).")
-                except pynetbox.core.query.RequestError:
-                    zabbix_tag = nb.extras.tags.get(slug="zabbix")
+            # Ensure "zabbix" tag is present
+            zabbix_tag = ensure_tag(nb, "zabbix")
             if zabbix_tag:
                 current_tags = [t.id for t in (nb_device.tags or [])]
                 if zabbix_tag.id not in current_tags:
@@ -955,8 +1313,19 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                     nb_device.save()
                     logger.info(f"Added 'zabbix' tag to device {device_name}.")
 
-        # Sync physical interfaces from UniFi to NetBox
-        if nb_device:
+            # Sync device state (ONLINE/OFFLINE -> active/offline)
+            try:
+                sync_device_state(nb, nb_device, device)
+            except Exception as e:
+                logger.warning(f"Failed to sync state for {device_name}: {e}")
+
+            # Sync custom fields (firmware, uptime, mac)
+            try:
+                sync_device_custom_fields(nb, nb_device, device)
+            except Exception as e:
+                logger.warning(f"Failed to sync custom fields for {device_name}: {e}")
+
+            # Sync physical interfaces from UniFi to NetBox
             try:
                 api_style = getattr(unifi, "api_style", "legacy") or "legacy"
                 sync_device_interfaces(nb, nb_device, device, api_style)
@@ -1057,10 +1426,23 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
 def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, tenant):
     """
     Process devices for a given site and add them to NetBox.
+    Also syncs VLANs, WiFi SSIDs, and uplink cables.
     """
     logger.debug(f"Processing site {site_display_name}...")
     try:
         if site_obj:
+            # Sync VLANs from UniFi networks
+            try:
+                sync_site_vlans(nb, site_obj, nb_site, tenant)
+            except Exception as e:
+                logger.warning(f"Failed to sync VLANs for site {site_display_name}: {e}")
+
+            # Sync WiFi SSIDs
+            try:
+                sync_site_wlans(nb, site_obj, nb_site, tenant)
+            except Exception as e:
+                logger.warning(f"Failed to sync WLANs for site {site_display_name}: {e}")
+
             logger.debug(f"Fetching devices for site: {site_display_name}")
             devices = site_obj.device.all()
             logger.debug(f"Found {len(devices)} devices for site {site_display_name}")
@@ -1075,6 +1457,34 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
                         future.result()
                     except Exception as e:
                         logger.error(f"Error processing a device at site {site_display_name}: {e}")
+
+            # Sync uplink cables after all devices are processed
+            try:
+                # Build a lookup of all NetBox devices by MAC for this site
+                nb_devices_at_site = nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id)
+                all_nb_devices_by_mac = {}
+                for d in nb_devices_at_site:
+                    serial = str(d.serial or "").upper().replace(":", "")
+                    if serial:
+                        all_nb_devices_by_mac[serial] = d
+                    # Also index by custom field MAC if available
+                    cf = dict(d.custom_fields or {})
+                    cf_mac = (cf.get("unifi_mac") or "").upper().replace(":", "")
+                    if cf_mac:
+                        all_nb_devices_by_mac[cf_mac] = d
+
+                for device in devices:
+                    device_serial = get_device_serial(device)
+                    if not device_serial:
+                        continue
+                    nb_device = nb.dcim.devices.get(site_id=nb_site.id, serial=device_serial)
+                    if nb_device:
+                        try:
+                            sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac)
+                        except Exception as e:
+                            logger.debug(f"Could not sync uplink cable for {get_device_name(device)}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to sync uplink cables for site {site_display_name}: {e}")
         else:
             logger.error(f"Site {site_display_name} not found")
     except Exception as e:
