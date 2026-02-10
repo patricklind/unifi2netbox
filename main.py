@@ -10,6 +10,7 @@ import logging
 import pynetbox
 import ipaddress
 import yaml
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
 # Import the unifi module instead of defining the Unifi class
@@ -28,22 +29,35 @@ MAX_THREADS = 8 # Define threads based on available system cores or default
 
 # Populated at runtime from NETBOX.ROLES in config
 netbox_device_roles = {}
+postable_fields_cache = {}
+postable_fields_lock = threading.Lock()
 
 def get_postable_fields(base_url, token, url_path):
     """
     Retrieves the POST-able fields for NetBox path.
     """
-    url = f"{base_url}/api/{url_path}/"
+    normalized_base = base_url.rstrip("/")
+    normalized_path = url_path.strip("/")
+    cache_key = (normalized_base, normalized_path)
+    with postable_fields_lock:
+        cached_fields = postable_fields_cache.get(cache_key)
+    if cached_fields is not None:
+        logger.debug(f"Using cached POST-able fields for NetBox path: {normalized_path}")
+        return cached_fields
+
+    url = f"{normalized_base}/api/{normalized_path}/"
     logger.debug(f"Retrieving POST-able fields from NetBox API: {url}")
     headers = {
         "Authorization": f"Token {token}",
         "Content-Type": "application/json",
     }
-    response = requests.options(url, headers=headers, verify=False)
+    response = requests.options(url, headers=headers, verify=False, timeout=15)
     response.raise_for_status()  # Raise an error if the response is not successful
 
     # Extract the available POST fields from the API schema
     fields = response.json().get("actions", {}).get("POST", {})
+    with postable_fields_lock:
+        postable_fields_cache[cache_key] = fields
     logger.debug(f"Retrieved {len(fields)} POST-able fields from NetBox API")
     return fields
 

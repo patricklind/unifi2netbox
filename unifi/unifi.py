@@ -1,9 +1,12 @@
 import json
 import logging
 import os
+import random
 import threading
 import time
 import warnings
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import pyotp
 import requests
@@ -28,6 +31,10 @@ class Unifi:
 
     SESSION_FILE = os.path.expanduser("~/.unifi_session.json")
     DEFAULT_TIMEOUT = 15
+    DEFAULT_HTTP_RETRIES = 3
+    RETRY_BACKOFF_BASE = 1.0
+    RETRY_BACKOFF_MAX = 30.0
+    RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
     _session_data = {}
 
     AUTH_MODES = (
@@ -69,6 +76,26 @@ class Unifi:
         self.api_style = None  # "integration" or "legacy"
         self.integration_api_base = None
         self.integration_auth_headers = {}
+        self.request_timeout = self._read_env_int(
+            "UNIFI_REQUEST_TIMEOUT",
+            self.DEFAULT_TIMEOUT,
+            minimum=1,
+        )
+        self.default_max_retries = self._read_env_int(
+            "UNIFI_HTTP_RETRIES",
+            self.DEFAULT_HTTP_RETRIES,
+            minimum=0,
+        )
+        self.retry_backoff_base = self._read_env_float(
+            "UNIFI_RETRY_BACKOFF_BASE",
+            self.RETRY_BACKOFF_BASE,
+            minimum=0.1,
+        )
+        self.retry_backoff_max = self._read_env_float(
+            "UNIFI_RETRY_BACKOFF_MAX",
+            self.RETRY_BACKOFF_MAX,
+            minimum=self.retry_backoff_base,
+        )
 
         if not self.base_url:
             raise ValueError("Missing required configuration: UniFi base URL")
@@ -108,6 +135,152 @@ class Unifi:
             return response.json()
         except (ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _read_env_int(name, default, minimum=0):
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            value = int(raw_value)
+        except ValueError:
+            logger.warning(
+                f"Invalid integer value for {name}: {raw_value}. Using default {default}."
+            )
+            return default
+        if value < minimum:
+            logger.warning(
+                f"Value for {name} must be >= {minimum}. Using default {default}."
+            )
+            return default
+        return value
+
+    @staticmethod
+    def _read_env_float(name, default, minimum=0.0):
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            value = float(raw_value)
+        except ValueError:
+            logger.warning(
+                f"Invalid float value for {name}: {raw_value}. Using default {default}."
+            )
+            return default
+        if value < minimum:
+            logger.warning(
+                f"Value for {name} must be >= {minimum}. Using default {default}."
+            )
+            return default
+        return value
+
+    def _effective_retries(self, max_retries):
+        if max_retries is None:
+            return self.default_max_retries
+        try:
+            return max(0, int(max_retries))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid max_retries value '{max_retries}'. "
+                f"Using default {self.default_max_retries}."
+            )
+            return self.default_max_retries
+
+    def _parse_retry_after_seconds(self, response):
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return None
+        retry_after = retry_after.strip()
+        if retry_after.isdigit():
+            return max(0.0, float(retry_after))
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        now = datetime.now(tz=retry_at.tzinfo)
+        return max(0.0, (retry_at - now).total_seconds())
+
+    def _compute_retry_delay_seconds(self, attempt_number, response=None):
+        retry_after_seconds = None
+        if response is not None:
+            retry_after_seconds = self._parse_retry_after_seconds(response)
+        if retry_after_seconds is not None:
+            return min(self.retry_backoff_max, retry_after_seconds)
+        base_delay = self.retry_backoff_base * (2 ** max(0, attempt_number))
+        delay = min(self.retry_backoff_max, base_delay)
+        jitter = delay * random.uniform(0.0, 0.25)
+        return min(self.retry_backoff_max, delay + jitter)
+
+    @staticmethod
+    def _extract_request_path(response):
+        request = getattr(response, "request", None)
+        if request is None:
+            return None
+        return getattr(request, "path_url", None)
+
+    def _build_error_payload(self, response, response_data=None):
+        payload = {
+            "statusCode": response.status_code,
+            "statusName": response.reason,
+            "requestPath": self._extract_request_path(response),
+            "requestId": response.headers.get("X-Request-ID")
+            or response.headers.get("x-request-id"),
+        }
+
+        if isinstance(response_data, dict):
+            meta = response_data.get("meta")
+            meta_message = meta.get("msg") if isinstance(meta, dict) else None
+            if isinstance(response_data.get("statusCode"), int):
+                payload["statusCode"] = response_data.get("statusCode")
+            payload["statusName"] = (
+                response_data.get("statusName")
+                or payload.get("statusName")
+            )
+            payload["code"] = response_data.get("code")
+            payload["message"] = (
+                response_data.get("message")
+                or meta_message
+                or response.text
+            )
+            payload["timestamp"] = response_data.get("timestamp")
+            payload["requestPath"] = (
+                response_data.get("requestPath")
+                or payload.get("requestPath")
+            )
+            payload["requestId"] = (
+                response_data.get("requestId")
+                or payload.get("requestId")
+            )
+        else:
+            payload["message"] = response.text
+
+        return {
+            key: value
+            for key, value in payload.items()
+            if value is not None and value != ""
+        }
+
+    @staticmethod
+    def _log_http_error(log_prefix, method, url, error_payload):
+        status_code = error_payload.get("statusCode")
+        error_code = error_payload.get("code")
+        message = error_payload.get("message")
+        request_id = error_payload.get("requestId")
+        logger.error(
+            f"{log_prefix} {method} {url} -> status={status_code} "
+            f"code={error_code or 'n/a'} message={message or 'n/a'} "
+            f"requestId={request_id or 'n/a'}"
+        )
+
+    @staticmethod
+    def _normalize_success_response(response, response_data):
+        if response_data is not None:
+            return response_data
+        if response.status_code == 204 or not response.text.strip():
+            return {}
+        return None
 
     def _build_api_url(self, endpoint):
         """Build URL for legacy APIs (session/cookie auth)."""
@@ -245,7 +418,7 @@ class Unifi:
                         info_url,
                         headers=headers,
                         verify=False,
-                        timeout=self.DEFAULT_TIMEOUT,
+                        timeout=self.request_timeout,
                     )
                 except requests.exceptions.RequestException as err:
                     logger.debug(
@@ -271,7 +444,7 @@ class Unifi:
                         headers=headers,
                         params={"offset": 0, "limit": 1},
                         verify=False,
-                        timeout=self.DEFAULT_TIMEOUT,
+                        timeout=self.request_timeout,
                     )
                 except requests.exceptions.RequestException:
                     continue
@@ -366,7 +539,7 @@ class Unifi:
                     login_url,
                     json=payload,
                     verify=False,
-                    timeout=self.DEFAULT_TIMEOUT,
+                    timeout=self.request_timeout,
                 )
             except requests.exceptions.RequestException as err:
                 logger.warning(f"Auth mode '{mode['name']}' request failed: {err}")
@@ -421,144 +594,198 @@ class Unifi:
             + ("; ".join(auth_errors) if auth_errors else "No auth mode succeeded.")
         )
 
-    def _make_request_legacy(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
-        if not self.session.cookies.get_dict():
-            logger.info("No valid session cookies present. Authenticating...")
-            self.authenticate()
-
-        headers = {"Content-Type": "application/json"}
-        if self.csrf_token:
-            headers["X-CSRF-Token"] = self.csrf_token
-
-        url = self._build_api_url(endpoint)
+    def _make_request_legacy(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=None):
+        retries = self._effective_retries(max_retries)
+        auth_max_attempts = max(1, retries + 1)
         method_upper = method.upper()
+        url = self._build_api_url(endpoint)
         logger.debug(f"Making legacy {method_upper} request to: {url}")
 
-        request_kwargs = {
-            "headers": headers,
-            "verify": False,
-            "timeout": self.DEFAULT_TIMEOUT,
-            "params": params,
-        }
-        if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
-            request_kwargs["json"] = data
+        for attempt in range(retry_count, retries + 1):
+            if not self.session.cookies.get_dict():
+                logger.info("No valid session cookies present. Authenticating...")
+                try:
+                    self.authenticate(max_retries=auth_max_attempts)
+                except Exception as err:
+                    return {
+                        "statusCode": 401,
+                        "code": "api.authentication.failed",
+                        "message": str(err),
+                    }
 
-        try:
-            response = self.session.request(method_upper, url, **request_kwargs)
-        except requests.exceptions.RequestException as err:
-            logger.error(f"Request exception: {err}")
-            logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
-            return None
+            headers = {"Content-Type": "application/json"}
+            if self.csrf_token:
+                headers["X-CSRF-Token"] = self.csrf_token
 
-        logger.debug(f"Response status code: {response.status_code}")
-
-        if response.status_code == 401 and retry_count < max_retries:
-            logger.warning("Session expired or unauthorized. Re-authenticating...")
-            self.authenticate(retry_count=0, max_retries=max_retries)
-            return self._make_request_legacy(
-                endpoint,
-                method=method_upper,
-                data=data,
-                params=params,
-                retry_count=retry_count + 1,
-                max_retries=max_retries,
-            )
-
-        response_data = self._parse_response_json(response)
-        if response.status_code >= 400:
-            if isinstance(response_data, dict):
-                logger.error(
-                    f"Request failed with {response.status_code}: "
-                    f"{response_data.get('meta', {}).get('msg', response_data.get('message', 'unknown error'))}"
-                )
-                return response_data
-            logger.error(
-                f"Request failed with {response.status_code} and non-JSON response."
-            )
-            return {
-                "statusCode": response.status_code,
-                "message": response.text,
+            request_kwargs = {
+                "headers": headers,
+                "verify": False,
+                "timeout": self.request_timeout,
+                "params": params,
             }
+            if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
+                request_kwargs["json"] = data
 
-        if response_data is None:
-            logger.error("Received non-JSON response from UniFi API.")
-            return None
+            try:
+                response = self.session.request(method_upper, url, **request_kwargs)
+            except requests.exceptions.RequestException as err:
+                if attempt < retries:
+                    delay = self._compute_retry_delay_seconds(attempt)
+                    logger.warning(
+                        f"Legacy request exception ({method_upper} {url}): {err}. "
+                        f"Retrying in {delay:.1f}s ({attempt + 1}/{retries})."
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(f"Legacy request exception: {err}")
+                logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
+                return {
+                    "statusCode": 0,
+                    "code": "request.exception",
+                    "message": str(err),
+                }
 
-        if isinstance(response_data, dict):
-            logger.debug(f"Request successful, response keys: {list(response_data.keys())}")
-        return response_data
+            self._refresh_session_metadata(response)
+            response_data = self._parse_response_json(response)
+            logger.debug(f"Response status code: {response.status_code}")
 
-    def _make_request_integration(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
+            if response.status_code == 401 and attempt < retries:
+                logger.warning("Session expired or unauthorized. Re-authenticating...")
+                try:
+                    self.authenticate(max_retries=auth_max_attempts)
+                except Exception as err:
+                    return {
+                        "statusCode": 401,
+                        "code": "api.authentication.failed",
+                        "message": str(err),
+                    }
+                continue
+
+            if response.status_code in self.RETRYABLE_STATUS_CODES and attempt < retries:
+                delay = self._compute_retry_delay_seconds(attempt, response=response)
+                logger.warning(
+                    f"Legacy request got transient status {response.status_code} "
+                    f"for {method_upper} {url}. Retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{retries})."
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code >= 400:
+                error_payload = self._build_error_payload(response, response_data)
+                self._log_http_error("Legacy request failed:", method_upper, url, error_payload)
+                return error_payload
+
+            normalized_response = self._normalize_success_response(response, response_data)
+            if normalized_response is None:
+                logger.error("Received non-JSON response from UniFi API.")
+                return {
+                    "statusCode": response.status_code,
+                    "code": "api.response.invalid-json",
+                    "message": "Received non-JSON response from UniFi API",
+                }
+            if isinstance(normalized_response, dict):
+                logger.debug(
+                    f"Request successful, response keys: {list(normalized_response.keys())}"
+                )
+            return normalized_response
+
+        return {
+            "statusCode": 503,
+            "code": "api.request.retries-exhausted",
+            "message": f"Legacy request failed after {retries + 1} attempts",
+        }
+
+    def _make_request_integration(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=None):
+        retries = self._effective_retries(max_retries)
         if not self.integration_api_base:
             if not self.configure_integration_api():
                 logger.error("Integration API is not configured.")
                 return {
                     "statusCode": 401,
+                    "code": "api.authentication.missing-credentials",
                     "message": "Integration API not configured",
                 }
 
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            **self.integration_auth_headers,
-        }
-
-        url = self._build_integration_url(endpoint)
         method_upper = method.upper()
+        url = self._build_integration_url(endpoint)
         logger.debug(f"Making integration {method_upper} request to: {url}")
+        reconfigured = False
 
-        request_kwargs = {
-            "headers": headers,
-            "verify": False,
-            "timeout": self.DEFAULT_TIMEOUT,
-            "params": params,
-        }
-        if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
-            request_kwargs["json"] = data
-
-        try:
-            response = self.session.request(method_upper, url, **request_kwargs)
-        except requests.exceptions.RequestException as err:
-            logger.error(f"Integration request exception: {err}")
-            logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
-            return None
-
-        response_data = self._parse_response_json(response)
-
-        if response.status_code == 401 and retry_count < max_retries:
-            # Retry header/base detection once in case auth header format changed.
-            if self.configure_integration_api():
-                return self._make_request_integration(
-                    endpoint,
-                    method=method_upper,
-                    data=data,
-                    params=params,
-                    retry_count=retry_count + 1,
-                    max_retries=max_retries,
-                )
-
-        if response.status_code >= 400:
-            if isinstance(response_data, dict):
-                logger.error(
-                    f"Integration request failed with {response.status_code}: "
-                    f"{response_data.get('code', response_data.get('message', 'unknown error'))}"
-                )
-                return response_data
-            logger.error(
-                f"Integration request failed with {response.status_code} and non-JSON response."
-            )
-            return {
-                "statusCode": response.status_code,
-                "message": response.text,
+        for attempt in range(retry_count, retries + 1):
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                **self.integration_auth_headers,
             }
+            request_kwargs = {
+                "headers": headers,
+                "verify": False,
+                "timeout": self.request_timeout,
+                "params": params,
+            }
+            if data is not None and method_upper in {"POST", "PUT", "PATCH"}:
+                request_kwargs["json"] = data
 
-        if response_data is None:
-            logger.error("Received non-JSON response from Integration API.")
-            return None
+            try:
+                response = self.session.request(method_upper, url, **request_kwargs)
+            except requests.exceptions.RequestException as err:
+                if attempt < retries:
+                    delay = self._compute_retry_delay_seconds(attempt)
+                    logger.warning(
+                        f"Integration request exception ({method_upper} {url}): {err}. "
+                        f"Retrying in {delay:.1f}s ({attempt + 1}/{retries})."
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(f"Integration request exception: {err}")
+                logger.debug(f"Request failed: {method_upper} {url}", exc_info=True)
+                return {
+                    "statusCode": 0,
+                    "code": "request.exception",
+                    "message": str(err),
+                }
 
-        return response_data
+            response_data = self._parse_response_json(response)
 
-    def make_request(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=3):
+            if response.status_code == 401 and attempt < retries:
+                # Retry header/base detection once in case auth header format changed.
+                if not reconfigured and self.configure_integration_api():
+                    reconfigured = True
+                    continue
+
+            if response.status_code in self.RETRYABLE_STATUS_CODES and attempt < retries:
+                delay = self._compute_retry_delay_seconds(attempt, response=response)
+                logger.warning(
+                    f"Integration request got transient status {response.status_code} "
+                    f"for {method_upper} {url}. Retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{retries})."
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code >= 400:
+                error_payload = self._build_error_payload(response, response_data)
+                self._log_http_error("Integration request failed:", method_upper, url, error_payload)
+                return error_payload
+
+            normalized_response = self._normalize_success_response(response, response_data)
+            if normalized_response is None:
+                logger.error("Received non-JSON response from Integration API.")
+                return {
+                    "statusCode": response.status_code,
+                    "code": "api.response.invalid-json",
+                    "message": "Received non-JSON response from Integration API",
+                }
+            return normalized_response
+
+        return {
+            "statusCode": 503,
+            "code": "api.request.retries-exhausted",
+            "message": f"Integration request failed after {retries + 1} attempts",
+        }
+
+    def make_request(self, endpoint, method="GET", data=None, params=None, retry_count=0, max_retries=None):
         """Make an authenticated request to the selected UniFi API style."""
         logger.debug(f"API request ({self.api_style}): {method} {endpoint}")
         if self.api_style == "integration":

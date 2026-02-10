@@ -42,6 +42,11 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    UNIFI_API_KEY=your-unifi-api-key
    # Optional, defaults to X-API-KEY
    UNIFI_API_KEY_HEADER=X-API-KEY
+   # Optional HTTP behavior tuning
+   UNIFI_REQUEST_TIMEOUT=15
+   UNIFI_HTTP_RETRIES=3
+   UNIFI_RETRY_BACKOFF_BASE=1.0
+   UNIFI_RETRY_BACKOFF_MAX=30.0
 
    # Optional fallback for legacy login flow
    UNIFI_USERNAME=your-unifi-username
