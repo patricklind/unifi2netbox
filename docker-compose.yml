@@ -1,0 +1,11 @@
+services:
+  unifi2netbox:
+    build:
+      context: .
+    container_name: unifi2netbox
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    command: ["python", "main.py", "-v"]

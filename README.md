@@ -5,7 +5,7 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
 ## Features
 
 - **Device Synchronization**: Automatically create or update devices from UniFi into NetBox.
-- **Site Mapping**: Customizable mapping between UniFi site names and NetBox site names via YAML configuration.
+- **Site Mapping**: Customizable mapping between UniFi site names and NetBox site names via `.env` or YAML configuration.
 - **Conflict Resolution**: Handle duplicate VRFs, IP addresses, and prefixes with advanced error handling and retry mechanisms.
 - **Custom Connection Management**: Optimize performance with configurable connection pooling for NetBox API communications.
 - **Detailed Logging**: Comprehensive logging with verbose mode for debugging and monitoring.
@@ -36,8 +36,19 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    pip install -r requirements.txt
    ```
 
-3. Create a `.env` file at the root of the project to store sensitive information such as usernames, passwords, and tokens. The `.env` file should look like this:
+3. Create your environment file:
+   ```bash
+   cp .env.example .env
+   ```
+
+4. Edit `.env` with your values (env vars are now the primary configuration source):
    ```plaintext
+   # Required core config
+   UNIFI_URLS=https://<controller-ip>:11443/proxy/network/integration/v1
+   NETBOX_URL=http://localhost:8080
+   NETBOX_TENANT=Organization Name
+   NETBOX_TOKEN=your-netbox-api-token
+
    # Preferred for UniFi Integration API v1
    UNIFI_API_KEY=your-unifi-api-key
    # Optional, defaults to X-API-KEY
@@ -53,59 +64,24 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    UNIFI_PASSWORD=your-unifi-password
    UNIFI_MFA_SECRET=your-unifi-mfa-secret
 
-   NETBOX_TOKEN=your-netbox-api-token
+   # Device roles (recommended format)
+   NETBOX_ROLE_WIRELESS=Wireless AP
+   NETBOX_ROLE_LAN=Switch
+   NETBOX_ROLE_GATEWAY=Gateway Firewall
+   NETBOX_ROLE_ROUTER=Router
+   NETBOX_ROLE_UNKNOWN=Network Device
    ```
    The script supports both UniFi Integration API key auth and legacy username/password login.
    `UNIFI_MFA_SECRET` is optional if your UniFi account does not use TOTP-based 2FA.
 
-4. Copy the sample configuration file to `config/config.yaml`:
+5. Optional: keep using `config/config.yaml` if you prefer file-based config. Environment variables will override YAML:
    ```bash
    cp config/config.yaml.SAMPLE config/config.yaml
    ```
-   
-5. Update the `config/config.yaml` file with your company-specific information (such as URLs, roles, and tenant names). For example:
-   ```yaml
-   UNIFI:
-     URLS:
-       # Integration API v1 (recommended)
-       - https://<controller-ip>:11443/proxy/network/integration/v1
-       # Legacy example:
-       # - https://<controller-ip>:8443
-   NETBOX:
-     URL: http://localhost:8080
-     ROLES:
-       WIRELESS: Wireless AP
-       LAN: Switch
-       GATEWAY: Gateway Firewall
-       ROUTER: Router
-       UNKNOWN: Network Device
-     TENANT: Organization Name
-   ```
 
 6. Configure site mapping (optional):
-   Site mapping is only needed if your UniFi site names differ from NetBox site names. You have two options for configuring site mappings:
-   
-   **Option 1: Configure in config.yaml (recommended)**
-   ```yaml
-   UNIFI:
-     # Other UNIFI settings...
-     # Set to true to use external site_mapping.yaml file
-     USE_SITE_MAPPING: false
-     # Define mappings directly in config.yaml
-     SITE_MAPPINGS:
-       "UniFi Site Name": "NetBox Site Name"
-       "Corporate Office": "HQ"
-   ```
-   
-   **Option 2: Use external mapping file**
-   Set `USE_SITE_MAPPING: true` in config.yaml, then edit `config/site_mapping.yaml`:
-   ```yaml
-   "UniFi Site Name": "NetBox Site Name"
-   "Corporate Office": "HQ"
-   "Remote Branch": "Branch-01"
-   ```
-   
-   If both options are configured, mappings in config.yaml take precedence.
+   - In `.env`: `UNIFI_SITE_MAPPINGS={"UniFi Site Name":"NetBox Site Name","Corporate Office":"HQ"}`
+   - Or use YAML mapping (`UNIFI.SITE_MAPPINGS` and/or `config/site_mapping.yaml`) as before.
 ## Obtaining the UniFi OTP Seed (MFA Secret)
 
 The OTP seed (also referred to as the MFA Secret) is required for Multi-Factor Authentication and must be added to the `.env` file. Follow these steps to obtain it:
@@ -138,7 +114,7 @@ If you do not have 2FA enabled, you will need to set it up to generate a new OTP
 
 ### Running the Integration Script
 
-Once the `.env` and `config/config.yaml` files are properly set up, you can run the script:
+Once `.env` is configured, you can run the script:
 
 ```bash
 python main.py
@@ -150,46 +126,31 @@ For verbose logging with detailed debug information:
 python main.py -v
 ```
 
+### Docker
+
+Build and run with Docker Compose (uses `.env` automatically):
+
+```bash
+docker compose up --build
+```
+
+Run detached:
+
+```bash
+docker compose up -d --build
+```
+
 ### Site Mapping
 
-Site mapping is optional and only needed if your UniFi site names differ from NetBox site names. You have two ways to configure site mappings:
+Site mapping is optional and only needed if your UniFi site names differ from NetBox site names.
 
-#### Option 1: Configure in config.yaml (recommended)
+- `.env` option:
+  - `UNIFI_SITE_MAPPINGS={"UniFi Site Name":"NetBox Site Name","Corporate Office":"HQ"}`
+- YAML option:
+  - `UNIFI.SITE_MAPPINGS` in `config/config.yaml`
+  - optional external `config/site_mapping.yaml` when `UNIFI_USE_SITE_MAPPING=true`
 
-Define your mappings directly in the main configuration file:
-
-```yaml
-UNIFI:
-  # Other settings...
-  # Set to false to disable external mapping file
-  USE_SITE_MAPPING: false
-  # Define mappings directly here
-  SITE_MAPPINGS:
-    "UniFi Site Name": "NetBox Site Name"
-    "Corporate Office": "HQ"
-```
-
-#### Option 2: Use external mapping file
-
-Enable the external mapping file in config.yaml:
-
-```yaml
-UNIFI:
-  # Other settings...
-  USE_SITE_MAPPING: true
-```
-
-Then edit the `config/site_mapping.yaml` file:
-
-```yaml
-"UniFi Site Name": "NetBox Site Name"
-"Corporate Office": "HQ"
-"Remote Branch": "Branch-01"
-```
-
-**Note:** If both options are configured, mappings in config.yaml take precedence over those in the external file.
-
-If a UniFi site name is not found in any mapping, the script will use the UniFi site name directly when looking for a matching NetBox site.
+If both `.env` and YAML are set, `.env` takes precedence.
 
 ### Logging
 
@@ -218,7 +179,7 @@ If you encounter issues with the integration:
 
 2. **Check log files**: Review the logs in the `logs` directory for specific errors
 
-3. **Verify site mapping**: Ensure your site mapping in `config/site_mapping.yaml` correctly maps UniFi sites to NetBox sites
+3. **Verify site mapping**: Check `UNIFI_SITE_MAPPINGS` in `.env` (or `config/site_mapping.yaml` if using YAML mode)
 
 4. **Authentication issues**: 
    - If using Integration API, verify `UNIFI_API_KEY` (and optionally `UNIFI_API_KEY_HEADER`) in `.env`
@@ -234,7 +195,8 @@ If you encounter issues with the integration:
 
 ### Device Roles
 
-`NETBOX.ROLES` supports multiple role keys. The script will infer the best key per device and fall back automatically:
+Device roles can be set with `NETBOX_ROLE_<KEY>` variables (recommended) or `NETBOX_ROLES` JSON.
+The script will infer the best key per device and fall back automatically:
 
 - `WIRELESS`: access points
 - `LAN`: switches

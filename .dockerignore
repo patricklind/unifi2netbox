@@ -1,0 +1,10 @@
+.git
+.idea
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.unifi_session.json
+logs/*
+!logs/.keep
