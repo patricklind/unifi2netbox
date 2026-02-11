@@ -1,4 +1,3 @@
-from icecream import ic
 import logging
 from .portconf import PortConf
 from .device import Device
@@ -19,9 +18,13 @@ class Sites:
         """
 
         self.unifi = unifi
-        self.name: str = data.get("name")
-        self.desc = data.get("desc")
-        self._id = data.get("_id")
+        # Legacy API: name=<site-code>, desc=<display-name>, _id=<object-id>
+        # Integration v1: id=<uuid>, internalReference=<site-code>, name=<display-name>
+        self._id = data.get("_id") or data.get("id")
+        self.internal_reference = data.get("internalReference")
+        self.desc = data.get("desc") or data.get("name") or self.internal_reference
+        self.name: str = data.get("name") or data.get("desc") or self.internal_reference or str(self._id)
+        self.api_id = data.get("id") or data.get("name") or self.internal_reference
 
         # Initialize resource classes
         self.port_conf = PortConf(self.unifi, self)

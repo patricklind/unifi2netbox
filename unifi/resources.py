@@ -1,7 +1,5 @@
 import logging
-from icecream import ic
 import os
-from requests.exceptions import HTTPError
 from datetime import datetime, timedelta
 import json
 import threading
@@ -44,6 +42,47 @@ class BaseResource:
                 raise ValueError(f'The attribute [name] must be of type str, not {type(value)}.')
         self._name = value
 
+    def _build_url(self, item_id=None, path=None):
+        site_name = getattr(self.site, "api_id", self.site.name)
+        parts = [self.api_path, site_name]
+        if self.base_path:
+            parts.append(self.base_path)
+        parts.append(self.endpoint)
+        if path:
+            parts.append(path)
+        elif item_id:
+            parts.append(str(item_id))
+        normalized = [str(part).strip("/") for part in parts if part is not None]
+        return "/" + "/".join(normalized)
+
+    @staticmethod
+    def _extract_response_data(response):
+        if response is None:
+            return None
+        if isinstance(response, dict):
+            status_code = response.get("statusCode")
+            if isinstance(status_code, int) and status_code >= 400:
+                return None
+            meta = response.get("meta")
+            if isinstance(meta, dict):
+                if meta.get("rc") == "ok":
+                    return response.get("data", {})
+                return None
+            if "data" in response:
+                return response.get("data")
+            return response
+        return response
+
+    @staticmethod
+    def _response_error_message(response):
+        if isinstance(response, dict):
+            meta = response.get("meta", {})
+            if isinstance(meta, dict) and meta.get("msg"):
+                return meta.get("msg")
+            if response.get("message"):
+                return response.get("message")
+        return "Unknown API error"
+
     def get(self, **filters):
         """
         Fetches and returns a single resource from the API based on the specified filters. The method
@@ -59,47 +98,32 @@ class BaseResource:
                             matching resources or multiple matches.
         """
         logger.debug(f"Getting {self.endpoint} with filters: {filters}")
-        site_name = self.site.name
-        if self.base_path:
-            url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}"
-        else:
-            url = f"{self.api_path}/{site_name}/{self.endpoint}"
-        logger.debug(f"Constructed URL for get: {url}")
+        items_data = self.all()
         matching_items = []
-        logger.debug(f"Making API request to get all items from: {url}")
-        all_items = self.unifi.make_request(url, 'GET')
-        if all_items.get("meta", {}).get('rc') == 'ok':
-            items_data = all_items.get('data', [])
-            logger.debug(f"Retrieved {len(items_data)} items from {self.endpoint}")
-            for item in items_data:
-                if all(item.get(key) == value for key, value in filters.items()):
-                    matching_items.append(item)
-                    logger.debug(f"Found matching item: {item.get('name', item.get('_id', 'unknown'))}")
-            
-            logger.debug(f"Found {len(matching_items)} matching items for filters: {filters}")
-            if len(matching_items) == 0:
-                logger.warning(f"No resource found for filters: {filters}")
-                raise ValueError(f"No resource found for filters: {filters}")
-            elif len(matching_items) > 1:
-                logger.warning(f"Multiple resources ({len(matching_items)}) found for filters: {filters}")
-                raise ValueError(
-                    f"Multiple resources found for filters: {filters}. Filters must return exactly one result.")
+        for item in items_data:
+            if all(item.get(key) == value for key, value in filters.items()):
+                matching_items.append(item)
+                logger.debug(f"Found matching item: {item.get('name', item.get('_id', item.get('id', 'unknown')))}")
 
-            # Exactly one item is retrieved; set it as the instance's data
-            data = matching_items[0]
-            logger.debug(f"Creating instance with data: {data.get('name', data.get('_id', 'unknown'))}")
-            instance = self.__class__(self.unifi, self.site, **data)
-            instance._id = data.get("_id", None)  # Set the item's ID if available
-            instance.name = data.get("name", None)
-            instance.data = data  # Populate data
-            logger.debug(f"Successfully retrieved {self.endpoint} with ID: {instance._id}")
-            return instance
-        else:
-            error_msg = all_items.get('meta', {}).get('msg')
-            logger.error(f"Failed to retrieve resource: {error_msg}")
-            raise ValueError(f"Failed to retrieve resource: {error_msg}")
+        logger.debug(f"Found {len(matching_items)} matching items for filters: {filters}")
+        if len(matching_items) == 0:
+            logger.warning(f"No resource found for filters: {filters}")
+            raise ValueError(f"No resource found for filters: {filters}")
+        if len(matching_items) > 1:
+            logger.warning(f"Multiple resources ({len(matching_items)}) found for filters: {filters}")
+            raise ValueError(
+                f"Multiple resources found for filters: {filters}. Filters must return exactly one result.")
 
-    def all(self) -> list:
+        data = matching_items[0]
+        logger.debug(f"Creating instance with data: {data.get('name', data.get('_id', data.get('id', 'unknown')))}")
+        instance = self.__class__(self.unifi, self.site, **data)
+        instance._id = data.get("_id") or data.get("id")
+        instance.name = data.get("name", None)
+        instance.data = data
+        logger.debug(f"Successfully retrieved {self.endpoint} with ID: {instance._id}")
+        return instance
+
+    def all(self, filter_query=None, limit=200) -> list:
         """
         Fetches all available items from the endpoint.
 
@@ -112,28 +136,47 @@ class BaseResource:
         :rtype: list
         """
         logger.debug(f"Fetching all items from endpoint: {self.endpoint}")
-        site_name = self.site.name
-        if self.base_path:
-            url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}"
-        else:
-            url = f"{self.api_path}/{site_name}/{self.endpoint}"
+        url = self._build_url()
         logger.debug(f"Constructed URL for all items: {url}")
-        logger.debug(f"Making API request to get all items from: {url}")
-        all_items = self.unifi.make_request(url, 'GET')
-        if not all_items:
-            logger.error(f'Could not get data for {self.endpoint}.')
+
+        if getattr(self.unifi, "api_style", None) == "integration":
+            offset = 0
+            all_items = []
+            while True:
+                params = {"offset": offset, "limit": limit}
+                if filter_query:
+                    params["filter"] = filter_query
+                response = self.unifi.make_request(url, "GET", params=params)
+                if not isinstance(response, dict):
+                    logger.error(f"Could not get data for {self.endpoint}.")
+                    return []
+                batch = self._extract_response_data(response)
+                if not isinstance(batch, list):
+                    logger.error(f"Unexpected response shape for {self.endpoint}: {response}")
+                    return []
+                all_items.extend(batch)
+                logger.debug(f"Retrieved {len(batch)} items at offset {offset} for {self.endpoint}")
+                if not batch:
+                    break
+                offset += len(batch)
+                total_count = response.get("totalCount")
+                if isinstance(total_count, int) and offset >= total_count:
+                    break
+                if len(batch) < response.get("limit", limit):
+                    break
+            logger.debug(f"Retrieved total {len(all_items)} items from {self.endpoint}")
+            return all_items
+
+        response = self.unifi.make_request(url, "GET")
+        data = self._extract_response_data(response)
+        if isinstance(data, list):
+            logger.debug(f"Retrieved {len(data)} items from {self.endpoint}")
+            return data
+        if data is None:
+            logger.error(f"Failed to retrieve all items: {self._response_error_message(response)}")
             return []
-        if isinstance(all_items, list):
-            logger.debug(f"Retrieved {len(all_items)} items from {self.endpoint}")
-        response = self.unifi.make_request(url, 'GET')
-        if response.get("meta", {}).get('rc') == 'ok':
-            items = response.get('data', [])
-            logger.debug(f"Retrieved {len(items)} items from {self.endpoint}")
-            return items
-        else:
-            error_msg = response.get('meta', {}).get('msg')
-            logger.error(f"Failed to retrieve all items: {error_msg}")
-            return []
+        logger.debug(f"Retrieved non-list data from {self.endpoint}, normalizing to single-item list")
+        return [data]
 
     def get_id(self, name: str) -> int:
         """
@@ -184,46 +227,35 @@ class BaseResource:
         :rtype: dict or None
         :raises ValueError: If no data is provided to create the resource.
         """
-        site_name = self.site.name
         if not data:
             data = self.data
         if not data:
             raise ValueError(f'No data to create {self.endpoint}.')
-        if self.base_path:
-            url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}"
-        else:
-            url = f"{self.api_path}/{site_name}/{self.endpoint}"
+        url = self._build_url()
         response = self.unifi.make_request(url, 'POST', data=data)
-        if response.get("meta", {}).get('rc') == 'ok':
+        response_data = self._extract_response_data(response)
+        if response_data is not None:
             logger.info(f"Successfully created {self.endpoint} at site '{self.site.desc}'")
-            return response.get('data', {})
-        else:
-            return response.get('meta', {})
+            return response_data
+        logger.error(f"Failed to create {self.endpoint}: {self._response_error_message(response)}")
+        return None
 
     def update(self, data: dict = None, path: str = None):
-        site_name = self.site.name
         if not data:
             data = self.data
         if not data:
             raise ValueError(f'No data to create {self.endpoint}.')
-        if path:
-            if self.base_path:
-                url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}/{path}"
-            else:
-                url = f"{self.api_path}/{site_name}/{self.endpoint}/{path}"
-        else:
-            if self.base_path:
-                url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}/{self._id}"
-            else:
-                url = f"{self.api_path}/{site_name}/{self.endpoint}/{self._id}"
-            path = None
+        item_path = path if path else self._id
+        if not item_path:
+            raise ValueError(f'No ID available to update {self.endpoint}.')
+        url = self._build_url(path=item_path)
         response = self.unifi.make_request(url, 'PUT', data=data)
-        if response.get("meta", {}).get('rc') == 'ok':
-            logger.info(f"Successfully updated {self.endpoint} with ID {self._id if self._id else path} at site '{self.site.desc}'")
-            return response.get('data', {})
-        else:
-            logger.error(f"Failed to update {self.endpoint} with ID {self._id}: {response}")
-            return None
+        response_data = self._extract_response_data(response)
+        if response_data is not None:
+            logger.info(f"Successfully updated {self.endpoint} with ID {item_path} at site '{self.site.desc}'")
+            return response_data
+        logger.error(f"Failed to update {self.endpoint} with ID {item_path}: {self._response_error_message(response)}")
+        return None
 
     def delete(self, item_id: int = None):
         """
@@ -239,22 +271,18 @@ class BaseResource:
 
         :raises ValueError: If no `item_id` is provided and the `_id` attribute is also not set.
         """
-        site_name = self.site.name
         if not item_id:
             item_id = self._id
         if not item_id:
             raise ValueError(f'Item ID required to delete {self.endpoint}.')
-        if self.base_path:
-            url = f"{self.api_path}/{site_name}/{self.base_path}/{self.endpoint}/{item_id}"
-        else:
-            url = f"{self.api_path}/{site_name}/{self.endpoint}/{item_id}"
+        url = self._build_url(item_id=item_id)
         response = self.unifi.make_request(url, 'DELETE')
-        if response.get("meta", {}).get('rc') == 'ok':
-            logger.info(f"Successfully deleted {self.endpoint} with ID {item_id} at site '{site_name}'")
+        response_data = self._extract_response_data(response)
+        if response_data is not None or response == {}:
+            logger.info(f"Successfully deleted {self.endpoint} with ID {item_id} at site '{self.site.name}'")
             return True
-        else:
-            logger.error(f"Failed to delete {self.endpoint} with ID {item_id} at site {site_name}: {response}")
-            return False
+        logger.error(f"Failed to delete {self.endpoint} with ID {item_id} at site {self.site.name}: {self._response_error_message(response)}")
+        return False
 
     def backup(self, backup_dir: str):
         """

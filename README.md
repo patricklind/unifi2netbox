@@ -1,241 +1,342 @@
-# NetBox and UniFi Integration
+# unifi2netbox
 
-This project provides a mechanism to integrate **NetBox** with **UniFi**, allowing you to synchronize devices and manage conflicts while maintaining accurate data within NetBox.
+unifi2netbox synchronizes devices, VLANs, WLANs, and uplink
+relationships from one or more UniFi Controllers into NetBox using the
+NetBox API.
 
-## Features
+The application is designed to keep NetBox as the authoritative
+inventory system while UniFi acts as the operational data source.
 
-- **Device Synchronization**: Automatically create or update devices from UniFi into NetBox.
-- **Site Mapping**: Customizable mapping between UniFi site names and NetBox site names via YAML configuration.
-- **Conflict Resolution**: Handle duplicate VRFs, IP addresses, and prefixes with advanced error handling and retry mechanisms.
-- **Custom Connection Management**: Optimize performance with configurable connection pooling for NetBox API communications.
-- **Detailed Logging**: Comprehensive logging with verbose mode for debugging and monitoring.
-- **Modular Design**: Improved code organization with a dedicated UniFi module for better maintainability.
+Synchronization direction:
 
-## Requirements
+UniFi → NetBox
 
-- Python 3.12 or later
-- Installed Python packages:
-  - `pynetbox`
-  - `requests`
-  - `pyotp`
-  - `PyYAML`
-  - `python-dotenv`
-  - `python-slugify`
-  - `urllib3`
+No data is written back to UniFi.
 
-## Installation
+------------------------------------------------------------------------
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/mrzepa/unifi2netbox.git
-   cd unifi2netbox
-   ```
+# Table of Contents
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+-   Architecture Overview
+-   Complete Configuration Reference
+-   .env.example Reference
+-   YAML Configuration Reference
+-   Full Runtime Flow
+-   Threading Model
+-   VLAN / WLAN Synchronization
+-   Device Synchronization Logic
+-   IP Address Handling
+-   Uplink Cable Synchronization
+-   Stale Device Handling
+-   Data Safety Considerations
+-   Performance Considerations
+-   Logging
+-   Deployment Recommendations
 
-3. Create a `.env` file at the root of the project to store sensitive information such as usernames, passwords, and tokens. The `.env` file should look like this:
-   ```plaintext
-   UNIFI_USERNAME=your-unifi-username
-   UNIFI_PASSWORD=your-unifi-password
-   UNIFI_MFA_SECRET=your-unifi-mfa-secret
-   NETBOX_TOKEN=your-netbox-api-token
-   ```
+------------------------------------------------------------------------
 
-4. Copy the sample configuration file to `config/config.yaml`:
-   ```bash
-   cp config/config.yaml.SAMPLE config/config.yaml
-   ```
-   
-5. Update the `config/config.yaml` file with your company-specific information (such as URLs, roles, and tenant names). For example:
-   ```yaml
-   UNIFI:
-     URLS:
-       - https://<controller-ip>:8443
-   NETBOX:
-     URL: http://localhost:8080
-     ROLES:
-       WIRELESS: Wireless AP
-       LAN: Switch
-     TENANT: Organization Name
-   ```
+# Architecture Overview
 
-6. Configure site mapping (optional):
-   Site mapping is only needed if your UniFi site names differ from NetBox site names. You have two options for configuring site mappings:
-   
-   **Option 1: Configure in config.yaml (recommended)**
-   ```yaml
-   UNIFI:
-     # Other UNIFI settings...
-     # Set to true to use external site_mapping.yaml file
-     USE_SITE_MAPPING: false
-     # Define mappings directly in config.yaml
-     SITE_MAPPINGS:
-       "UniFi Site Name": "NetBox Site Name"
-       "Corporate Office": "HQ"
-   ```
-   
-   **Option 2: Use external mapping file**
-   Set `USE_SITE_MAPPING: true` in config.yaml, then edit `config/site_mapping.yaml`:
-   ```yaml
-   "UniFi Site Name": "NetBox Site Name"
-   "Corporate Office": "HQ"
-   "Remote Branch": "Branch-01"
-   ```
-   
-   If both options are configured, mappings in config.yaml take precedence.
-## Obtaining the UniFi OTP Seed (MFA Secret)
+Runtime pipeline:
 
-The OTP seed (also referred to as the MFA Secret) is required for Multi-Factor Authentication and must be added to the `.env` file. Follow these steps to obtain it:
+UniFi Controller API\
+↓\
+UniFi API wrapper (unifi/)\
+↓\
+Normalization / Mapping Layer\
+↓\
+NetBox API (pynetbox)
 
-1. **Log in to your UniFi account**:
-   Go to [https://account.ui.com](https://account.ui.com) and log in with your UniFi credentials.
+Core components:
 
-2. **Access your profile**:
-   Once logged in, select your profile in the top-right corner of the page.
+-   main.py --- orchestration layer
+-   unifi/ --- UniFi API abstraction layer
+-   config/ --- YAML configuration
+-   Environment variables (.env)
+-   Thread pool execution model
 
-3. **Manage security settings**:
-   In the profile menu, select **Manage Security**.
+------------------------------------------------------------------------
 
-4. **Retrieve the MFA Secret**:
-   Under the "Multi-Factor Authentication" section:
-   - Click: Add New Method.
-   - Select App authentication.
-   - Select "Enter code manually", or use a QR code scanner.
-   - The text output will contain the OTP seed (a base32 string). This is your `UNIFI_MFA_SECRET`.
-   - Make sure to select App authentication as your primary MFA.
+# Complete Configuration Reference
 
-5. Add the OTP seed to your `.env` file:
-   ```plaintext
-   UNIFI_MFA_SECRET=your-otp-seed
-   ```
+Configuration is divided into:
 
-If you do not have 2FA enabled, you will need to set it up to generate a new OTP seed.
+1.  Environment variables (.env)
+2.  YAML configuration file
+3.  Runtime arguments
 
-## Usage
+Both layers are required for proper execution.
 
-### Running the Integration Script
+------------------------------------------------------------------------
 
-Once the `.env` and `config/config.yaml` files are properly set up, you can run the script:
+# .env.example Reference
 
-```bash
-python main.py
-```
+The following environment variables are expected:
 
-For verbose logging with detailed debug information:
+## NetBox Configuration
 
-```bash
+NETBOX_URL= NETBOX_TOKEN= NETBOX_TENANT=
+
+NETBOX_URL\
+Base URL of the NetBox instance (e.g., https://netbox.example.com)
+
+NETBOX_TOKEN\
+API token with write access to: - DCIM - IPAM - Tenancy
+
+NETBOX_TENANT\
+Tenant name used when assigning devices and IP addresses.
+
+------------------------------------------------------------------------
+
+## UniFi Configuration
+
+UNIFI_URLS=
+
+Comma-separated list of controller URLs.
+
+Example: UNIFI_URLS=https://unifi1.local,https://unifi2.local
+
+Authentication (choose one):
+
+Option 1: UNIFI_API_KEY=
+
+Option 2: UNIFI_USERNAME= UNIFI_PASSWORD=
+
+------------------------------------------------------------------------
+
+## Optional / Advanced Variables
+
+SSL verification is disabled by default inside the HTTP session.
+
+If modifying code, SSL behavior can be enforced by enabling request
+verification.
+
+------------------------------------------------------------------------
+
+# YAML Configuration Reference
+
+Example structure:
+
+NETBOX: ROLES: WIRELESS: AP SWITCH: Switch GATEWAY: Router
+
+SYNC_VLANS: true SYNC_WLANS: true SYNC_STALE_CLEANUP: true
+
+MAX_CONTROLLER_THREADS: 5 MAX_SITE_THREADS: 10 MAX_DEVICE_THREADS: 20
+
+------------------------------------------------------------------------
+
+## NETBOX.ROLES
+
+Maps UniFi device types to NetBox device roles.
+
+Keys: - WIRELESS - SWITCH - GATEWAY
+
+Values: Existing or auto-created NetBox role names.
+
+Roles are auto-created if missing.
+
+------------------------------------------------------------------------
+
+## SYNC_VLANS
+
+If true: - UniFi networks are synchronized into NetBox VLAN objects.
+
+If false: - VLAN synchronization is skipped.
+
+------------------------------------------------------------------------
+
+## SYNC_WLANS
+
+If true: - UniFi WLAN definitions are synchronized.
+
+If false: - WLAN synchronization is skipped.
+
+------------------------------------------------------------------------
+
+## SYNC_STALE_CLEANUP
+
+If true: - Devices present in NetBox but missing in UniFi - Are marked
+as status: offline
+
+Devices are NOT deleted.
+
+------------------------------------------------------------------------
+
+## Threading Parameters
+
+MAX_CONTROLLER_THREADS\
+Parallel controllers
+
+MAX_SITE_THREADS\
+Parallel sites per controller
+
+MAX_DEVICE_THREADS\
+Parallel devices per site
+
+Improper tuning can result in: - API rate limiting - High memory usage -
+Connection pool exhaustion
+
+------------------------------------------------------------------------
+
+# Full Runtime Flow
+
+1.  Load environment variables
+2.  Load YAML configuration
+3.  Initialize HTTP session (custom connection pool)
+4.  Initialize NetBox API client (pynetbox, threading enabled)
+5.  Ensure manufacturer exists (Ubiquity)
+6.  Ensure tenant exists
+7.  Ensure device roles exist
+8.  Fetch all NetBox sites
+9.  Start controller thread pool
+
+For each controller: Fetch sites For each matching site: Optionally sync
+VLANs Optionally sync WLANs Sync devices Sync uplink cables Optionally
+mark stale devices
+
+------------------------------------------------------------------------
+
+# Threading Model
+
+Hierarchy:
+
+Controller Thread └── Site Thread └── Device Thread
+
+Custom HTTPAdapter pool size: 50 connections.
+
+NetBox client uses threading=True to allow concurrent API calls.
+
+------------------------------------------------------------------------
+
+# VLAN / WLAN Synchronization
+
+If enabled:
+
+-   UniFi networks are mapped to NetBox VLAN objects.
+-   UniFi WLAN definitions are imported depending on implementation in
+    unifi/wlanconf.py.
+-   Existing VLANs are looked up before creation.
+-   No destructive deletion is performed.
+
+------------------------------------------------------------------------
+
+# Device Synchronization Logic
+
+For each UniFi device:
+
+1.  Extract:
+    -   Serial
+    -   MAC
+    -   Model
+    -   Firmware
+    -   IP
+    -   Site
+2.  Match NetBox device by:
+    -   Serial (primary)
+    -   Custom field unifi_mac (secondary)
+3.  If device exists:
+    -   Update fields
+4.  If device does not exist:
+    -   Create new device
+
+Manufacturer auto-ensured: Ubiquity
+
+------------------------------------------------------------------------
+
+# IP Address Handling
+
+Process:
+
+1.  Lookup prefix in NetBox using contains filter
+2.  If VRF present → filter by VRF
+3.  Derive subnet mask from matched prefix
+4.  Construct IP/CIDR string
+5.  If IP changed:
+    -   Delete old IP object
+    -   Create new IP object
+6.  Assign to interface vlan.1
+7.  Set as primary_ip4
+
+Important: Management interface name is hardcoded as vlan.1.
+
+------------------------------------------------------------------------
+
+# Uplink Cable Synchronization
+
+After device creation:
+
+1.  Build dictionary:
+    -   serial → device
+    -   unifi_mac → device
+2.  Inspect UniFi uplink data
+3.  Create NetBox cable objects between interfaces
+
+No automatic removal of old cables unless handled explicitly in sync
+logic.
+
+------------------------------------------------------------------------
+
+# Stale Device Handling
+
+If SYNC_STALE_CLEANUP is true:
+
+Devices in NetBox but missing in UniFi:
+
+→ status set to offline
+
+No deletion occurs.
+
+------------------------------------------------------------------------
+
+# Data Safety Considerations
+
+-   Old IP objects are deleted if IP changes.
+-   No rollback if API call partially fails.
+-   Script assumes valid prefix structure in NetBox.
+-   SSL verification disabled in default HTTP session.
+-   Hardcoded interface naming assumption.
+
+------------------------------------------------------------------------
+
+# Performance Considerations
+
+High-scale deployments should:
+
+-   Reduce MAX_DEVICE_THREADS
+-   Monitor NetBox API latency
+-   Ensure sufficient API rate limits
+-   Increase HTTP connection pool if necessary
+
+Large environments (\>1000 devices): Testing recommended before
+production deployment.
+
+------------------------------------------------------------------------
+
+# Logging
+
+Standard log level: INFO
+
+Verbose mode:
+
 python main.py -v
-```
 
-### Site Mapping
+Logs include: - Created devices - Updated devices - VLAN/WLAN sync
+status - Cable sync actions - Stale device marking - API errors
 
-Site mapping is optional and only needed if your UniFi site names differ from NetBox site names. You have two ways to configure site mappings:
+------------------------------------------------------------------------
 
-#### Option 1: Configure in config.yaml (recommended)
+# Deployment Recommendations
 
-Define your mappings directly in the main configuration file:
+-   Run as scheduled task (cron, systemd timer, or container scheduler)
+-   Use staging NetBox instance for testing
+-   Monitor API response times
+-   Avoid excessive thread counts
+-   Enable proper SSL verification in production
 
-```yaml
-UNIFI:
-  # Other settings...
-  # Set to false to disable external mapping file
-  USE_SITE_MAPPING: false
-  # Define mappings directly here
-  SITE_MAPPINGS:
-    "UniFi Site Name": "NetBox Site Name"
-    "Corporate Office": "HQ"
-```
+------------------------------------------------------------------------
 
-#### Option 2: Use external mapping file
+# Disclaimer
 
-Enable the external mapping file in config.yaml:
+This script performs direct write operations in NetBox via API.
 
-```yaml
-UNIFI:
-  # Other settings...
-  USE_SITE_MAPPING: true
-```
-
-Then edit the `config/site_mapping.yaml` file:
-
-```yaml
-"UniFi Site Name": "NetBox Site Name"
-"Corporate Office": "HQ"
-"Remote Branch": "Branch-01"
-```
-
-**Note:** If both options are configured, mappings in config.yaml take precedence over those in the external file.
-
-If a UniFi site name is not found in any mapping, the script will use the UniFi site name directly when looking for a matching NetBox site.
-
-### Logging
-
-The script logs information at different levels:
-
-- **INFO**: Standard operational information (default level)
-- **DEBUG**: Detailed debugging information (enabled with `-v` flag)
-- **WARNING**: Potential issues that don't prevent operation
-- **ERROR**: Problems that prevent specific operations
-- **CRITICAL**: Critical failures
-
-All logs are written to the `logs` directory. Logs are organized by severity (e.g., `info.log`, `error.log`) for easier debugging. Example of an error log:
-
-```plaintext
-2025-01-22 14:24:54,390 - ERROR - Unable to delete VRF at site X: '409 Conflict'
-```
-
-### Troubleshooting
-
-If you encounter issues with the integration:
-
-1. **Run with verbose logging**: Use the `-v` flag to enable detailed debug output
-   ```bash
-   python main.py -v
-   ```
-
-2. **Check log files**: Review the logs in the `logs` directory for specific errors
-
-3. **Verify site mapping**: Ensure your site mapping in `config/site_mapping.yaml` correctly maps UniFi sites to NetBox sites
-
-4. **Authentication issues**: 
-   - Verify your UniFi credentials and MFA secret in the `.env` file
-   - Check that your NetBox API token has appropriate permissions
-
-5. **API connectivity**: 
-   - Ensure the UniFi controller is accessible at the configured URL
-   - Verify the NetBox API is reachable and responding
-
-6. **Session issues**: If you encounter authentication problems, try deleting the session file and running again
-
-### Handling Conflicts
-
-If there are conflicts (e.g., duplicate device names, VRFs, or IP addresses), the script:
-- Logs the issue in the error log.
-- Attempts to resolve it automatically where possible.
-- Skips problematic devices or sites if the issue cannot be resolved.
-
-## Contributing
-
-Contributions are welcome! To contribute to this project:
-1. Fork the repository.
-2. Create a branch for your feature or bugfix:
-   ```bash
-   git checkout -b feature/my-feature
-   ```
-3. Commit your changes and push the branch:
-   ```bash
-   git commit -m "Add my feature"
-   git push origin feature/my-feature
-   ```
-4. Open a pull request.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- This project was inspired by the need for unified network management.
+Validate configuration and test thoroughly before production use.
