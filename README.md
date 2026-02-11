@@ -16,6 +16,9 @@ to UniFi).
 
 - [Architecture Overview](#architecture-overview)
 - [Quick Start](#quick-start)
+  - [Docker](#docker-recommended)
+  - [LXC / Proxmox](#lxc--proxmox)
+  - [Bare-metal / VM](#bare-metal--vm)
 - [Configuration Reference](#configuration-reference)
   - [Environment Variables](#environment-variables)
   - [YAML Configuration](#yaml-configuration)
@@ -64,6 +67,8 @@ Core components:
 
 ## Quick Start
 
+### Docker (recommended)
+
 1. Copy `.env.example` to `.env` and fill in your credentials.
 2. Optionally edit `config/site_mapping.yaml` for site name mapping.
 3. Run:
@@ -74,6 +79,34 @@ docker compose up --build
 
 The container runs continuously and syncs on each cycle. Verbose
 logging is enabled by default (`-v` flag in docker-compose.yml).
+
+### LXC / Proxmox
+
+One-command provisioning on a Proxmox host:
+
+```bash
+bash lxc/create-lxc.sh [CTID]
+```
+
+This creates a Debian 12 LXC container, installs dependencies, sets up
+a Python venv, and registers a systemd service. Edit
+`/opt/unifi2netbox/.env` inside the container, then start:
+
+```bash
+systemctl start unifi2netbox
+journalctl -u unifi2netbox -f
+```
+
+### Bare-metal / VM
+
+Run the installer on any Debian/Ubuntu system:
+
+```bash
+sudo bash lxc/install.sh
+```
+
+The service is installed to `/opt/unifi2netbox` with a dedicated system
+user and systemd unit.
 
 ------------------------------------------------------------------------
 
@@ -533,7 +566,8 @@ docker compose up
 
 ## Deployment Recommendations
 
-- Run as a scheduled container (`restart: unless-stopped`)
+- **Docker**: Use `restart: unless-stopped` for automatic recovery
+- **LXC/VM**: The systemd service restarts on failure with 30 s delay
 - Use a staging NetBox instance for initial testing
 - Monitor NetBox API response times
 - Start with lower thread counts for large environments (>1000

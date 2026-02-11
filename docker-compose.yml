@@ -2,6 +2,7 @@ services:
   unifi2netbox:
     build:
       context: .
+    image: unifi2netbox:latest
     container_name: unifi2netbox
     env_file:
       - .env
@@ -10,9 +11,3 @@ services:
       - ./config:/app/config:ro
     command: ["python", "main.py", "-v"]
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
