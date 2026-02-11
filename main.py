@@ -1645,6 +1645,147 @@ def select_netbox_role_for_device(device):
     first_key = next(iter(netbox_device_roles))
     return netbox_device_roles[first_key], first_key
 
+
+# ──────────────────────────────────────────────────────────────
+# UniFi device-type specs database
+# Maps UniFi model codes to hardware specifications for NetBox.
+# Keys: model string as returned by UniFi API.
+# ──────────────────────────────────────────────────────────────
+UNIFI_MODEL_SPECS = {
+    # ── Switches ──────────────────────────────────────────────
+    "US8P60":       {"part_number": "US-8-60W",             "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 60},
+    "US 8 60W":     {"part_number": "US-8-60W",             "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 60},
+    "US8P150":      {"part_number": "US-8-150W",            "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
+    "US 8 PoE 150W":{"part_number": "US-8-150W",            "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
+    "US68P":        {"part_number": "USW-Lite-8-PoE",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 52},
+    "USLP8P":       {"part_number": "USW-Lite-8-PoE",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 52},
+    "US16P150":     {"part_number": "US-16-150W",           "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
+    "US 16 PoE 150W":{"part_number": "US-16-150W",          "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
+    "US24P250":     {"part_number": "US-24-250W",           "u_height": 1, "ports": [("Port {n}", "1000base-t", 24), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 250},
+    "US 24 PoE 250W":{"part_number": "US-24-250W",          "u_height": 1, "ports": [("Port {n}", "1000base-t", 24), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 250},
+    "US48PRO":      {"part_number": "USW-Pro-48-PoE",       "u_height": 1, "ports": [("Port {n}", "1000base-t", 48), ("SFP+ {n}", "10gbase-x-sfpp", 4)], "poe_budget": 600},
+    "USW Pro 48 PoE":{"part_number": "USW-Pro-48-PoE",      "u_height": 1, "ports": [("Port {n}", "1000base-t", 48), ("SFP+ {n}", "10gbase-x-sfpp", 4)], "poe_budget": 600},
+    "US6XG150":     {"part_number": "US-XG-6POE",           "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 150},
+    "US XG 6 PoE":  {"part_number": "US-XG-6POE",           "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 150},
+    "USMINI":       {"part_number": "USW-Flex-Mini",        "u_height": 0, "ports": [("Port {n}", "1000base-t", 5)], "poe_budget": 0},
+    "USW Flex Mini": {"part_number": "USW-Flex-Mini",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 5)], "poe_budget": 0},
+    "USXG":         {"part_number": "USW-Aggregation",      "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 8)], "poe_budget": 0},
+    "USW Aggregation":{"part_number": "USW-Aggregation",    "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 8)], "poe_budget": 0},
+    "USAGGPRO":     {"part_number": "USW-Pro-Aggregation",  "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 28), ("SFP28 {n}", "25gbase-x-sfp28", 4)], "poe_budget": 0},
+    "USW Pro Aggregation":{"part_number": "USW-Pro-Aggregation","u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 28), ("SFP28 {n}", "25gbase-x-sfp28", 4)], "poe_budget": 0},
+    "USL8A":        {"part_number": "USW-Lite-8",           "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 0},
+    "USPM16P":      {"part_number": "USW-Pro-Max-16-PoE",   "u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 16), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 180},
+    "USW Pro Max 16 PoE":{"part_number": "USW-Pro-Max-16-PoE","u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 16), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 180},
+    "USPM24P":      {"part_number": "USW-Pro-Max-24-PoE",   "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("Port {n}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 400},
+    "USW Pro Max 24 PoE":{"part_number": "USW-Pro-Max-24-PoE","u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("Port {n}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 400},
+    "USW Pro 8 PoE":{"part_number": "USW-Pro-8-PoE",        "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 120},
+    "USW Enterprise 8 PoE":{"part_number": "USW-Enterprise-8-PoE","u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 120},
+    "US XG 16":     {"part_number": "US-XG-16",             "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 12)], "poe_budget": 0},
+    # ── Gateways ──────────────────────────────────────────────
+    "UXGPRO":       {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
+    "Gateway Pro":  {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
+    # ── Access Points ─────────────────────────────────────────
+    "U7LT":         {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "UAP-AC-Lite":  {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "U7MSH":        {"part_number": "UAP-AC-M",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "AC Mesh":      {"part_number": "UAP-AC-M",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "UAL6":         {"part_number": "U6-LR",                "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "U6 Lite":      {"part_number": "U6-Lite",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "UFLHD":        {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "FlexHD":       {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    # ── UISP / airMAX ────────────────────────────────────────
+    "Rocket Prism 5AC Gen2":{"part_number": "RP-5AC-Gen2",  "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "LiteAP AC":    {"part_number": "LAP-120",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "LiteBeam 5AC Gen2":{"part_number": "LBE-5AC-Gen2",    "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "Nanostation 5AC":{"part_number": "NS-5AC",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+}
+
+
+def ensure_device_type_specs(nb, nb_device_type, model):
+    """Ensure a device type has correct specs (part number, u_height, interface templates)
+    based on the UNIFI_MODEL_SPECS database. Also cleans up duplicate templates."""
+    specs = UNIFI_MODEL_SPECS.get(model)
+    if not specs:
+        return
+
+    changed = False
+    # Update part number and u_height if missing/wrong
+    if specs.get("part_number") and (nb_device_type.part_number or "") != specs["part_number"]:
+        nb_device_type.part_number = specs["part_number"]
+        changed = True
+    if specs.get("u_height") is not None and nb_device_type.u_height != specs["u_height"]:
+        nb_device_type.u_height = specs["u_height"]
+        changed = True
+    # Add PoE budget as comment if available
+    poe = specs.get("poe_budget", 0)
+    expected_comments = f"PoE budget: {poe}W" if poe else ""
+    if expected_comments and (nb_device_type.comments or "") != expected_comments:
+        nb_device_type.comments = expected_comments
+        changed = True
+    if changed:
+        try:
+            nb_device_type.save()
+            logger.info(f"Updated device type specs for {model}: part#={specs.get('part_number')}, "
+                        f"u_height={specs.get('u_height')}, PoE={poe}W")
+        except Exception as e:
+            logger.warning(f"Failed to update device type specs for {model}: {e}")
+
+    # Sync interface templates — delete all existing and recreate from specs
+    existing_templates = list(nb.dcim.interface_templates.filter(devicetype_id=nb_device_type.id))
+    expected_ports = []
+    for port_spec in specs.get("ports", []):
+        pattern, port_type, count = port_spec
+        if count == 1 and "{n}" not in pattern:
+            # Single named port (e.g. "WAN 1", "eth0")
+            expected_ports.append((pattern, port_type))
+        else:
+            for i in range(1, count + 1):
+                name = pattern.replace("{n}", str(i))
+                expected_ports.append((name, port_type))
+
+    # Build set of what exists
+    existing_by_name = {}
+    for tmpl in existing_templates:
+        key = tmpl.name
+        if key not in existing_by_name:
+            existing_by_name[key] = tmpl
+        else:
+            # Duplicate template — delete it
+            try:
+                tmpl.delete()
+                logger.debug(f"Deleted duplicate template '{key}' from {model}")
+            except Exception:
+                pass
+
+    # Check if templates already match
+    expected_set = set((name, ptype) for name, ptype in expected_ports)
+    existing_set = set()
+    for name, tmpl in existing_by_name.items():
+        tmpl_type = tmpl.type.value if tmpl.type else ""
+        existing_set.add((name, tmpl_type))
+
+    if expected_set == existing_set:
+        return  # Templates already correct
+
+    # Delete all existing templates and recreate
+    for tmpl in existing_by_name.values():
+        try:
+            tmpl.delete()
+        except Exception:
+            pass
+
+    for name, port_type in expected_ports:
+        try:
+            nb.dcim.interface_templates.create({
+                "device_type": nb_device_type.id,
+                "name": name,
+                "type": port_type,
+            })
+        except pynetbox.core.query.RequestError:
+            pass  # May already exist from race condition
+    logger.info(f"Synced {len(expected_ports)} interface templates for {model}")
+
+
 def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ips=None, unifi_site_obj=None):
     """Process a device and add it to NetBox."""
     try:
