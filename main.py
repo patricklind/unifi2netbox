@@ -515,8 +515,9 @@ def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="
         try:
             network = ipaddress.ip_network(f"{static_ip}/{subnet_mask}", strict=False)
             gateway = str(list(network.hosts())[0])  # First host in subnet
-        except Exception:
+        except Exception as e:
             gateway = static_ip.rsplit(".", 1)[0] + ".1"  # Fallback: x.x.x.1
+            logger.debug(f"Could not compute gateway from prefix, using fallback {gateway}: {e}")
 
     api_style = getattr(unifi, "api_style", "legacy")
     if api_style == "integration":
@@ -848,9 +849,13 @@ def ensure_tag(nb, name, slug=None, color=None):
             if tag:
                 logger.info(f"Created tag '{name}' in NetBox.")
     except pynetbox.core.query.RequestError:
+        # Race condition: another thread created it
         tag = nb.extras.tags.get(slug=slug)
-    with _tag_lock:
-        _tag_cache[slug] = tag
+    if tag:
+        with _tag_lock:
+            _tag_cache[slug] = tag
+    else:
+        logger.warning(f"Could not ensure tag '{name}' in NetBox")
     return tag
 
 
@@ -876,15 +881,17 @@ def sync_device_state(nb, nb_device, device):
 
 
 def sync_device_custom_fields(nb, nb_device, device):
-    """Sync firmware version and uptime from UniFi to NetBox custom fields."""
+    """Sync firmware version, uptime, MAC, and last seen from UniFi to NetBox custom fields."""
     # Ensure custom fields exist
     ensure_custom_field(nb, "unifi_firmware", cf_type="text", label="UniFi Firmware")
     ensure_custom_field(nb, "unifi_uptime", cf_type="integer", label="UniFi Uptime (sec)")
     ensure_custom_field(nb, "unifi_mac", cf_type="text", label="UniFi MAC")
+    ensure_custom_field(nb, "unifi_last_seen", cf_type="text", label="UniFi Last Seen")
 
     firmware = device.get("firmwareVersion") or device.get("version") or device.get("fw_version")
     uptime = device.get("uptimeSec") or device.get("uptime") or device.get("_uptime")
     mac = device.get("macAddress") or device.get("mac")
+    last_seen = device.get("lastSeen") or device.get("last_seen")
 
     cf = dict(nb_device.custom_fields or {})
     changed = False
@@ -903,6 +910,19 @@ def sync_device_custom_fields(nb, nb_device, device):
     if mac and cf.get("unifi_mac") != mac:
         cf["unifi_mac"] = mac
         changed = True
+    # Last seen: store as ISO timestamp or raw value
+    if last_seen:
+        last_seen_str = str(last_seen)
+        # Convert epoch seconds to readable format
+        if last_seen_str.isdigit() and len(last_seen_str) >= 10:
+            try:
+                from datetime import datetime, timezone
+                last_seen_str = datetime.fromtimestamp(int(last_seen_str), tz=timezone.utc).isoformat()
+            except (ValueError, OSError):
+                pass
+        if cf.get("unifi_last_seen") != last_seen_str:
+            cf["unifi_last_seen"] = last_seen_str
+            changed = True
 
     if changed:
         nb_device.custom_fields = cf
@@ -911,61 +931,125 @@ def sync_device_custom_fields(nb, nb_device, device):
 
 
 def sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac):
-    """Create cable between device uplink port and upstream device if both exist in NetBox."""
+    """Create cable between device uplink port and upstream device if both exist in NetBox.
+    For offline devices: remove existing cables instead of creating new ones."""
+    device_name = get_device_name(device)
+
+    # Check if device is offline — remove cables and skip
+    device_state = (device.get("state") or device.get("status") or "").upper()
+    if device_state in ("OFFLINE", "DISCONNECTED", "0"):
+        # Remove all cables from this device's interfaces
+        try:
+            ifaces = list(nb.dcim.interfaces.filter(device_id=nb_device.id))
+            for iface in ifaces:
+                if iface.cable:
+                    try:
+                        cable_id = iface.cable.id if hasattr(iface.cable, 'id') else iface.cable
+                        cable_obj = nb.dcim.cables.get(cable_id)
+                        if cable_obj:
+                            cable_obj.delete()
+                            logger.info(f"Removed cable from offline device {device_name}:{iface.name}")
+                    except Exception as e:
+                        logger.debug(f"Could not remove cable from {device_name}:{iface.name}: {e}")
+        except Exception as e:
+            logger.debug(f"Could not check cables for offline device {device_name}: {e}")
+        return
+
     # Integration API: uplink.deviceId; Legacy: uplink_mac or uplink.mac
-    uplink = device.get("uplink") or {}
+    # Prefer _detail_uplink (from device detail API) over the list-level uplink
+    uplink = device.get("_detail_uplink") or device.get("uplink") or {}
+    logger.debug(f"Cable sync for {device_name}: uplink keys={list(uplink.keys()) if uplink else 'none'}, uplink={uplink}")
     upstream_device_id = uplink.get("deviceId") or uplink.get("device_id")
-    upstream_mac = uplink.get("uplink_mac") or uplink.get("mac")
-    uplink_port_name = uplink.get("name") or uplink.get("uplink_port") or uplink.get("port_name")
+    upstream_mac = uplink.get("uplink_mac") or uplink.get("mac") or uplink.get("macAddress")
+    uplink_port_name = uplink.get("name") or uplink.get("uplink_port") or uplink.get("port_name") or uplink.get("portName")
+    upstream_port_name = uplink.get("uplink_remote_port") or uplink.get("remotePort") or uplink.get("port_name")
 
     if not upstream_device_id and not upstream_mac:
+        logger.debug(f"Cable sync for {device_name}: no upstream deviceId or MAC in uplink data")
         return
 
-    # Find upstream device in NetBox
+    logger.debug(f"Cable sync for {device_name}: upstream_device_id={upstream_device_id}, upstream_mac={upstream_mac}, uplink_port={uplink_port_name}, upstream_port={upstream_port_name}")
+
+    # Find upstream device in NetBox (O(1) lookup via dict)
     upstream_nb = None
     if upstream_mac:
-        normalized_mac = upstream_mac.upper().replace(":", "")
+        normalized_mac = upstream_mac.upper().replace(":", "").replace("-", "")
         upstream_nb = all_nb_devices_by_mac.get(normalized_mac)
-    # If not found by MAC, try by looking up serial (for integration API deviceId is UUID)
+        if not upstream_nb:
+            logger.debug(f"Cable sync for {device_name}: upstream MAC {normalized_mac} not found in lookup (keys: {list(all_nb_devices_by_mac.keys())[:5]}...)")
     if not upstream_nb and upstream_device_id:
-        # The upstream_device_id might be in our devices cache
-        for mac_key, dev in all_nb_devices_by_mac.items():
-            if str(getattr(dev, 'serial', '')) == str(upstream_device_id):
-                upstream_nb = dev
-                break
+        # Try UUID-based lookup (Integration API stores device UUIDs)
+        upstream_nb = all_nb_devices_by_mac.get(str(upstream_device_id))
+        if not upstream_nb:
+            logger.debug(f"Cable sync for {device_name}: upstream UUID {upstream_device_id} not found in lookup")
 
     if not upstream_nb:
+        logger.debug(f"Cable sync for {device_name}: upstream device not found in NetBox")
         return
 
+    logger.debug(f"Cable sync for {device_name}: found upstream device {upstream_nb.name}")
+
     # Find the uplink interface on our device
-    device_name = get_device_name(device)
     our_iface = None
     if uplink_port_name:
         our_iface = nb.dcim.interfaces.get(device_id=nb_device.id, name=uplink_port_name)
     if not our_iface:
         # Try to find any interface marked as uplink
-        all_ifaces = nb.dcim.interfaces.filter(device_id=nb_device.id)
-        for iface in all_ifaces:
+        all_ifaces = list(nb.dcim.interfaces.filter(device_id=nb_device.id))
+        # Filter to only cabled (ethernet/physical) interfaces — exclude wireless types
+        iface_types = [(i.name, str(i.type.value) if i.type else "none") for i in all_ifaces]
+        logger.debug(f"Cable sync for {device_name}: all interfaces: {iface_types}")
+        wired_ifaces = [i for i in all_ifaces if i.type and i.type.value not in ("virtual", "lag") and not str(i.type.value).startswith("ieee802.11")]
+        for iface in wired_ifaces:
             if iface.description and "uplink" in iface.description.lower():
                 our_iface = iface
                 break
+        # Last resort: use the last physical port (commonly uplink on switches)
+        if not our_iface and wired_ifaces:
+            physical_ifaces = [i for i in wired_ifaces if i.type and i.type.value not in ("virtual", "lag")]
+            if physical_ifaces:
+                our_iface = physical_ifaces[-1]
+        # For APs with no wired interfaces, create an eth0 interface for uplink
+        if not our_iface and not wired_ifaces:
+            try:
+                our_iface = nb.dcim.interfaces.create({
+                    "device": nb_device.id,
+                    "name": "eth0",
+                    "type": "1000base-t",
+                    "description": "Uplink (auto-created)",
+                })
+                if our_iface:
+                    logger.info(f"Created eth0 uplink interface for {device_name}")
+            except pynetbox.core.query.RequestError as e:
+                logger.debug(f"Could not create eth0 for {device_name}: {e}")
 
     if not our_iface:
+        logger.debug(f"Cable sync for {device_name}: no suitable uplink interface found on device (port_name={uplink_port_name})")
         return
 
     # Check if cable already exists on this interface
     if our_iface.cable:
-        return  # Cable already connected
+        logger.debug(f"Cable sync for {device_name}: cable already exists on {our_iface.name}")
+        return
 
-    # Find a port on upstream device to connect to (prefer matching name)
+    # Find a port on upstream device to connect to
     upstream_iface = None
     upstream_ifaces = list(nb.dcim.interfaces.filter(device_id=upstream_nb.id))
-    for iface in upstream_ifaces:
-        if not iface.cable:  # Find an unconnected port
-            upstream_iface = iface
-            break
+    # Prefer matching the remote port name from uplink data
+    if upstream_port_name:
+        for iface in upstream_ifaces:
+            if iface.name == upstream_port_name and not iface.cable:
+                upstream_iface = iface
+                break
+    # Fallback: any unconnected physical port
+    if not upstream_iface:
+        for iface in upstream_ifaces:
+            if not iface.cable and iface.type and iface.type.value not in ("virtual", "lag"):
+                upstream_iface = iface
+                break
 
     if not upstream_iface:
+        logger.debug(f"Cable sync for {device_name}: no available interface on upstream device {upstream_nb.name} (upstream_port={upstream_port_name})")
         return
 
     with _cable_lock:
@@ -978,7 +1062,7 @@ def sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac):
             if cable:
                 logger.info(f"Created cable: {device_name}:{our_iface.name} <-> {upstream_nb.name}:{upstream_iface.name}")
         except pynetbox.core.query.RequestError as e:
-            logger.debug(f"Could not create cable for {device_name}: {e}")
+            logger.warning(f"Could not create cable for {device_name}: {e}")
 
 
 def sync_site_vlans(nb, site_obj, nb_site, tenant):
@@ -1015,8 +1099,8 @@ def sync_site_vlans(nb, site_obj, nb_site, tenant):
                     "name": nb_site.name,
                     "slug": slugify(nb_site.name),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"VLAN group fallback for {nb_site.name}: {e}")
 
     for net in networks:
         vlan_id = net.get("vlanId") or net.get("vlan") or net.get("vlan_id")
@@ -1070,8 +1154,8 @@ def sync_site_vlans(nb, site_obj, nb_site, tenant):
                     existing.name = net_name
                     existing.save()
                     logger.debug(f"Updated VLAN {vlan_id} name to '{net_name}'")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to update VLAN {vlan_id} name: {e}")
 
 
 def sync_site_wlans(nb, site_obj, nb_site, tenant):
@@ -1130,8 +1214,8 @@ def sync_site_wlans(nb, site_obj, nb_site, tenant):
             matches = list(nb.wireless.wireless_lans.filter(**filters))
             if matches:
                 existing = matches[0]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not check existing wireless LAN '{ssid}': {e}")
 
         if not existing:
             try:
@@ -1161,8 +1245,8 @@ def sync_site_wlans(nb, site_obj, nb_site, tenant):
                 try:
                     existing.save()
                     logger.debug(f"Updated wireless LAN '{ssid}'")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to update wireless LAN '{ssid}': {e}")
 
 
 def map_unifi_port_to_netbox_type(port, api_style="integration"):
@@ -1303,11 +1387,22 @@ def normalize_radio_data(device, api_style="integration"):
         if "?" in name:
             continue
         nb_type = map_unifi_radio_to_netbox_type(radio)
+        # Build rich description: band, channel, tx power
+        desc_parts = []
+        band = radio.get("band") or radio.get("radio") or ""
+        if band:
+            desc_parts.append(str(band).upper())
+        channel = radio.get("channel")
+        if channel:
+            desc_parts.append(f"Ch {channel}")
+        tx_power = radio.get("txPower") or radio.get("tx_power") or radio.get("tx_power_mode")
+        if tx_power:
+            desc_parts.append(f"TX {tx_power}dBm" if str(tx_power).isdigit() else f"TX {tx_power}")
         radios.append({
             "name": name,
             "type": nb_type,
             "enabled": True,
-            "description": f"Channel {radio.get('channel')}" if radio.get("channel") else "",
+            "description": " | ".join(desc_parts) if desc_parts else "",
         })
     return radios
 
@@ -1354,6 +1449,7 @@ def sync_device_interfaces(nb, nb_device, device, api_style="integration", unifi
 
     # Integration API v1: device list only returns interfaces: ["ports"]/["radios"]
     # as metadata strings. We need to fetch actual port data via a separate API call.
+    original_device = device  # Keep reference to original for uplink merge
     interfaces = device.get("interfaces")
     if api_style == "integration" and isinstance(interfaces, list) and unifi and site_obj:
         device_id = device.get("id")
@@ -1378,6 +1474,11 @@ def sync_device_interfaces(nb, nb_device, device, api_style="integration", unifi
                         device["radio_table"] = radio_table
                     # Switch to legacy-style parsing since we have port_table/radio_table
                     api_style = "legacy"
+                # Merge uplink data from detail into ORIGINAL device dict for cable sync
+                detail_uplink = detail.get("uplink")
+                if detail_uplink and isinstance(detail_uplink, dict):
+                    original_device["_detail_uplink"] = detail_uplink
+                    logger.debug(f"Stored uplink detail for {device_name}: {list(detail_uplink.keys())}")
             else:
                 logger.debug(f"No detail data returned for {device_name} from Integration API")
 
@@ -1873,16 +1974,18 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
     try:
         if site_obj:
             # Sync VLANs from UniFi networks
-            try:
-                sync_site_vlans(nb, site_obj, nb_site, tenant)
-            except Exception as e:
-                logger.warning(f"Failed to sync VLANs for site {site_display_name}: {e}")
+            if os.getenv("SYNC_VLANS", "true").strip().lower() in ("true", "1", "yes"):
+                try:
+                    sync_site_vlans(nb, site_obj, nb_site, tenant)
+                except Exception as e:
+                    logger.warning(f"Failed to sync VLANs for site {site_display_name}: {e}")
 
             # Sync WiFi SSIDs
-            try:
-                sync_site_wlans(nb, site_obj, nb_site, tenant)
-            except Exception as e:
-                logger.warning(f"Failed to sync WLANs for site {site_display_name}: {e}")
+            if os.getenv("SYNC_WLANS", "true").strip().lower() in ("true", "1", "yes"):
+                try:
+                    sync_site_wlans(nb, site_obj, nb_site, tenant)
+                except Exception as e:
+                    logger.warning(f"Failed to sync WLANs for site {site_display_name}: {e}")
 
             logger.debug(f"Fetching devices for site: {site_display_name}")
             devices = site_obj.device.all()
@@ -1907,32 +2010,73 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
                         logger.error(f"Error processing a device at site {site_display_name}: {e}")
 
             # Sync uplink cables after all devices are processed
-            try:
-                # Build a lookup of all NetBox devices by MAC for this site
-                nb_devices_at_site = nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id)
-                all_nb_devices_by_mac = {}
-                for d in nb_devices_at_site:
-                    serial = str(d.serial or "").upper().replace(":", "")
-                    if serial:
-                        all_nb_devices_by_mac[serial] = d
-                    # Also index by custom field MAC if available
-                    cf = dict(d.custom_fields or {})
-                    cf_mac = (cf.get("unifi_mac") or "").upper().replace(":", "")
-                    if cf_mac:
-                        all_nb_devices_by_mac[cf_mac] = d
+            if os.getenv("SYNC_CABLES", "true").strip().lower() in ("true", "1", "yes"):
+                try:
+                    # Build a lookup of all NetBox devices by MAC/serial/UUID for this site
+                    nb_devices_at_site = nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id)
+                    all_nb_devices_by_mac = {}
+                    for d in nb_devices_at_site:
+                        serial = str(d.serial or "").upper().replace(":", "")
+                        if serial:
+                            all_nb_devices_by_mac[serial] = d
+                        # Also index by custom field MAC if available
+                        cf = dict(d.custom_fields or {})
+                        cf_mac = (cf.get("unifi_mac") or "").upper().replace(":", "")
+                        if cf_mac:
+                            all_nb_devices_by_mac[cf_mac] = d
+                    # Index UniFi device UUIDs for O(1) upstream lookup
+                    for unifi_dev in devices:
+                        dev_id = unifi_dev.get("id")
+                        dev_serial = get_device_serial(unifi_dev)
+                        if dev_id and dev_serial and dev_serial in all_nb_devices_by_mac:
+                            all_nb_devices_by_mac[str(dev_id)] = all_nb_devices_by_mac[dev_serial]
 
-                for device in devices:
-                    device_serial = get_device_serial(device)
-                    if not device_serial:
-                        continue
-                    nb_device = nb.dcim.devices.get(site_id=nb_site.id, serial=device_serial)
-                    if nb_device:
-                        try:
-                            sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac)
-                        except Exception as e:
-                            logger.debug(f"Could not sync uplink cable for {get_device_name(device)}: {e}")
-            except Exception as e:
-                logger.warning(f"Failed to sync uplink cables for site {site_display_name}: {e}")
+                    # Ensure all devices have uplink data from device detail API
+                    # (sync_device_interfaces only fetches detail for devices with list-type interfaces)
+                    api_style = getattr(unifi, "api_style", "legacy") or "legacy"
+                    if api_style == "integration":
+                        for device in devices:
+                            if not device.get("_detail_uplink"):
+                                device_id = device.get("id")
+                                if device_id:
+                                    detail = _fetch_integration_device_detail(unifi, site_obj, device_id)
+                                    if detail and isinstance(detail, dict):
+                                        detail_uplink = detail.get("uplink")
+                                        if detail_uplink and isinstance(detail_uplink, dict):
+                                            device["_detail_uplink"] = detail_uplink
+
+                    for device in devices:
+                        device_serial = get_device_serial(device)
+                        if not device_serial:
+                            continue
+                        # Use the already-built lookup instead of an extra API call
+                        nb_device = all_nb_devices_by_mac.get(device_serial)
+                        if nb_device:
+                            try:
+                                sync_uplink_cable(nb, nb_device, device, all_nb_devices_by_mac)
+                            except Exception as e:
+                                logger.debug(f"Could not sync uplink cable for {get_device_name(device)}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to sync uplink cables for site {site_display_name}: {e}")
+
+            # Mark stale devices (in NetBox but no longer in UniFi) as offline
+            if os.getenv("SYNC_STALE_CLEANUP", "true").strip().lower() in ("true", "1", "yes"):
+                try:
+                    unifi_serials = set()
+                    for d in devices:
+                        s = get_device_serial(d)
+                        if s:
+                            unifi_serials.add(s)
+                    nb_devices_at_site = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+                    for nb_dev in nb_devices_at_site:
+                        if nb_dev.serial and nb_dev.serial not in unifi_serials:
+                            current_status = nb_dev.status.value if hasattr(nb_dev.status, 'value') else str(nb_dev.status)
+                            if current_status != "offline":
+                                nb_dev.status = "offline"
+                                nb_dev.save()
+                                logger.info(f"Marked stale device '{nb_dev.name}' as offline (not in UniFi)")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up stale devices for site {site_display_name}: {e}")
         else:
             logger.error(f"Site {site_display_name} not found")
     except Exception as e:
