@@ -1,598 +1,262 @@
 # unifi2netbox
 
-Synchronizes devices, interfaces, VLANs, WLANs, uplink cables, and
-device type specifications from one or more UniFi Controllers into
-NetBox.
+Synchronizes devices, interfaces, VLANs, WLANs, uplink cables, and device type specifications from one or more UniFi Controllers into NetBox.
 
-NetBox is kept as the authoritative inventory while UniFi provides the
-operational data.
+NetBox is kept as the authoritative inventory while UniFi provides the operational data. Synchronization direction: **UniFi → NetBox** (no data is written back to UniFi).
 
-Synchronization direction: **UniFi → NetBox** (no data is written back
-to UniFi).
-
-------------------------------------------------------------------------
+---
 
 ## Table of Contents
 
-- [Architecture Overview](#architecture-overview)
+- [Features](#features)
 - [Quick Start](#quick-start)
-  - [Docker](#docker-recommended)
-  - [LXC / Proxmox](#lxc--proxmox)
-  - [Bare-metal / VM](#bare-metal--vm)
-- [Configuration Reference](#configuration-reference)
-  - [Environment Variables](#environment-variables)
-  - [YAML Configuration](#yaml-configuration)
-  - [Site Mapping](#site-mapping)
-- [Feature Reference](#feature-reference)
-  - [Device Synchronization](#device-synchronization)
-  - [Device Type Specs Sync](#device-type-specs-sync)
-  - [Interface Synchronization](#interface-synchronization)
-  - [IP Address Handling](#ip-address-handling)
-  - [DHCP-to-Static IP Conversion](#dhcp-to-static-ip-conversion)
-  - [VRF Handling](#vrf-handling)
-  - [VLAN / WLAN Synchronization](#vlan--wlan-synchronization)
-  - [Uplink Cable Synchronization](#uplink-cable-synchronization)
-  - [Stale Device Cleanup](#stale-device-cleanup)
+- [Configuration](#configuration)
+- [Community Device Specs](#community-device-specs)
+- [NetBox Cleanup](#netbox-cleanup)
+- [Continuous Sync](#continuous-sync)
 - [Supported Hardware](#supported-hardware)
-- [Threading Model](#threading-model)
-- [Logging](#logging)
-- [Data Safety Considerations](#data-safety-considerations)
-- [Deployment Recommendations](#deployment-recommendations)
+- [Architecture](#architecture)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
-------------------------------------------------------------------------
+---
 
-## Architecture Overview
+## Features
 
-```
-UniFi Controller API (Integration or Legacy)
-  ↓
-UniFi API wrapper (unifi/)
-  ↓
-Normalization / Mapping Layer (main.py)
-  ↓
-NetBox API (pynetbox)
-```
-
-Core components:
-
-| File / Directory | Purpose |
+| Feature | Description |
 |---|---|
-| `main.py` | Orchestration, device/cable/interface sync, device type specs |
-| `unifi/` | UniFi API abstraction (supports Integration and Legacy API) |
-| `config/` | YAML configuration and site mapping |
-| `.env` | Environment variables |
-| `docker-compose.yml` | Container deployment |
+| **Device Sync** | Creates and updates devices with serial, MAC, firmware, IP, model, site |
+| **Interface Sync** | Physical ports, radio interfaces, speed, PoE mode, MAC |
+| **Device Type Specs** | Auto-populates port templates, console/power ports from 173+ Ubiquiti models |
+| **VLAN / WLAN Sync** | Imports UniFi networks and wireless SSIDs into NetBox |
+| **Cable Sync** | Maps uplink cables between devices |
+| **DHCP Auto-Discovery** | Detects DHCP ranges from UniFi and assigns static IPs |
+| **VRF Support** | Optional VRF per site (existing, create, or none) |
+| **Cleanup** | Deletes stale devices, orphan interfaces/IPs/cables, unused device types |
+| **Continuous Sync** | Runs every N seconds (configurable, default 10 min) |
+| **Multi-Controller** | Supports multiple UniFi controllers in parallel |
+| **Dual API** | Works with both Integration API (v1) and Legacy API (username/password) |
 
-------------------------------------------------------------------------
+---
 
 ## Quick Start
 
 ### Docker (recommended)
 
-1. Copy `.env.example` to `.env` and fill in your credentials.
-2. Optionally edit `config/site_mapping.yaml` for site name mapping.
-3. Run:
-
 ```bash
+cp .env.example .env
+# Edit .env with your UniFi and NetBox credentials
 docker compose up --build
 ```
 
-The container runs continuously and syncs on each cycle. Verbose
-logging is enabled by default (`-v` flag in docker-compose.yml).
+The container syncs continuously every 10 minutes by default (`SYNC_INTERVAL=600`).
 
 ### LXC / Proxmox
 
-One-command provisioning on a Proxmox host:
-
 ```bash
 bash lxc/create-lxc.sh [CTID]
-```
-
-This creates a Debian 12 LXC container, installs dependencies, sets up
-a Python venv, and registers a systemd service. Edit
-`/opt/unifi2netbox/.env` inside the container, then start:
-
-```bash
+# Edit /opt/unifi2netbox/.env inside the container
 systemctl start unifi2netbox
-journalctl -u unifi2netbox -f
 ```
 
 ### Bare-metal / VM
 
-Run the installer on any Debian/Ubuntu system:
-
 ```bash
 sudo bash lxc/install.sh
+# Edit /opt/unifi2netbox/.env
+systemctl start unifi2netbox
 ```
 
-The service is installed to `/opt/unifi2netbox` with a dedicated system
-user and systemd unit.
+---
 
-------------------------------------------------------------------------
+## Configuration
 
-## Configuration Reference
+Configuration comes from environment variables (`.env`) with optional YAML override (`config/config.yaml`). Environment variables take precedence.
 
-Configuration comes from two sources (environment variables override
-YAML values):
+See [`.env.example`](.env.example) for a fully commented reference of all 37 environment variables.
 
-1. Environment variables (`.env`)
-2. YAML configuration (`config/config.yaml`)
+For detailed configuration documentation, see [docs/configuration.md](docs/configuration.md).
 
-### Environment Variables
+### Essential Variables
 
-#### NetBox Connection
+| Variable | Required | Description |
+|---|---|---|
+| `UNIFI_URLS` | Yes | Controller URL(s) |
+| `UNIFI_API_KEY` | * | API key (Integration API) |
+| `UNIFI_USERNAME` / `UNIFI_PASSWORD` | * | Credentials (Legacy API) |
+| `NETBOX_URL` | Yes | NetBox base URL |
+| `NETBOX_TOKEN` | Yes | NetBox API token |
+| `NETBOX_TENANT` | Yes | Tenant name |
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `NETBOX_URL` | Yes | — | NetBox base URL (e.g. `https://netbox.example.com`) |
-| `NETBOX_TOKEN` | Yes | — | API token with write access to DCIM, IPAM, Tenancy |
-| `NETBOX_TENANT` | Yes | — | Tenant name for device/IP assignment |
-| `NETBOX_DEVICE_STATUS` | No | `offline` | Status for newly created devices |
+\* Either API key or username/password is required.
 
-#### UniFi Connection
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `UNIFI_URLS` | Yes | — | Comma-separated or JSON array of controller URLs |
-| `UNIFI_API_KEY` | * | — | API key authentication (Integration API) |
-| `UNIFI_API_KEY_HEADER` | No | `X-API-KEY` | Custom header name for API key |
-| `UNIFI_USERNAME` | * | — | Username authentication (Legacy API) |
-| `UNIFI_PASSWORD` | * | — | Password for username auth |
-| `UNIFI_MFA_SECRET` | No | — | MFA/TOTP secret for 2FA login |
-
-\* Either `UNIFI_API_KEY` or `UNIFI_USERNAME`/`UNIFI_PASSWORD` is required.
-
-#### Serial Number Handling
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `NETBOX_SERIAL_MODE` | No | `mac` | How device serial is determined |
-
-Modes:
-
-- `mac` — Use UniFi serial, fallback to MAC (uppercase, no colons),
-  then device ID
-- `unifi` — Only use serial from UniFi (may be empty)
-- `id` — Use UniFi serial, fallback to device ID
-- `none` — Do not set serial field
-
-#### VRF Handling
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `NETBOX_VRF_MODE` | No | `existing` | How VRFs are managed |
-
-Modes:
-
-- `none` / `disabled` / `off` — No VRF; all IPs in default routing
-- `existing` / `get` — Use VRF if it exists (named after site), never create
-- `create` / `site` — Create VRF named after site if missing
-
-#### Device Role Mapping
-
-Roles can be set individually or as a JSON map:
+### Feature Toggles
 
 | Variable | Default | Description |
 |---|---|---|
-| `NETBOX_ROLE_WIRELESS` | `Wireless AP` | Role for access points |
-| `NETBOX_ROLE_LAN` | `Switch` | Role for switches |
-| `NETBOX_ROLE_GATEWAY` | `Gateway Firewall` | Role for gateways/UDM |
-| `NETBOX_ROLE_ROUTER` | `Router` | Role for routers |
-| `NETBOX_ROLE_UNKNOWN` | `Network Device` | Fallback role |
-
-Or as JSON (overrides individual vars):
-
-```
-NETBOX_ROLES={"WIRELESS":"Wireless AP","LAN":"Switch","GATEWAY":"Gateway Firewall"}
-```
-
-Roles are auto-created in NetBox if they do not exist.
-
-#### Site Mapping
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `UNIFI_USE_SITE_MAPPING` | No | `false` | Enable site name mapping |
-| `UNIFI_SITE_MAPPINGS` | No | — | JSON map of UniFi→NetBox site names |
-
-#### Feature Toggles
-
-| Variable | Default | Description |
-|---|---|---|
-| `SYNC_INTERFACES` | `true` | Sync physical ports and radio interfaces |
+| `SYNC_INTERFACES` | `true` | Sync physical ports and radios |
 | `SYNC_VLANS` | `true` | Sync VLANs from UniFi networks |
-| `SYNC_WLANS` | `true` | Sync wireless network definitions |
-| `SYNC_CABLES` | `true` | Sync uplink cables between devices |
-| `SYNC_STALE_CLEANUP` | `true` | Mark missing devices as offline |
+| `SYNC_WLANS` | `true` | Sync wireless SSIDs |
+| `SYNC_CABLES` | `true` | Sync uplink cables |
+| `SYNC_STALE_CLEANUP` | `true` | Mark missing devices offline |
+| `NETBOX_CLEANUP` | `false` | **Destructive** cleanup of stale data |
+| `SYNC_INTERVAL` | `600` | Seconds between sync runs (0 = once) |
 
-#### DHCP Range Configuration
+---
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DHCP_AUTO_DISCOVER` | No | `true` | Auto-detect DHCP ranges from UniFi network configs |
-| `DHCP_RANGES` | No | — | Additional manual CIDR ranges (merged with auto-discovered) |
+## Community Device Specs
 
-**Auto-discovery** (default): DHCP-enabled subnets are automatically
-extracted from UniFi's network configuration (`dhcpd_enabled` +
-`ip_subnet`). No manual configuration needed.
+unifi2netbox includes a bundled hardware database of **173 Ubiquiti device types** sourced from the [netbox-community/devicetype-library](https://github.com/netbox-community/devicetype-library).
 
-Manual ranges from `DHCP_RANGES` are merged with auto-discovered
-ranges (duplicates are deduplicated).
+For each known device, the following is automatically populated:
 
-Example (manual override / addition):
+- Interface templates with correct types (1000base-t, 10gbase-x-sfpp, etc.)
+- PoE mode and type per port
+- Console port templates (RJ-45)
+- Power port templates with max/allocated draw
+- Part number, U height, airflow, weight
+- Full depth and rack-mount info
 
-```
-DHCP_RANGES=192.168.100.0/24,172.16.0.0/16
-```
+The community specs are merged with a hardcoded database (`UNIFI_MODEL_SPECS`) of ~47 models. Hardcoded values always take precedence, ensuring manual overrides are preserved.
 
-To disable auto-discovery and rely solely on manual ranges:
+**New devices**: When an unknown UniFi device appears, unifi2netbox automatically creates a rich device type from the community database if a match is found.
 
-```
-DHCP_AUTO_DISCOVER=false
-```
+See [docs/device-specs.md](docs/device-specs.md) for details on the merge logic and how to add custom specs.
 
-Devices with IPs in these ranges are assigned a static IP from the
-same prefix (outside the DHCP pool). The candidate IP is verified via
-ping before assignment.
+---
 
-#### HTTP Tuning
+## NetBox Cleanup
 
-| Variable | Default | Description |
-|---|---|---|
-| `UNIFI_REQUEST_TIMEOUT` | `15` | HTTP request timeout in seconds |
-| `UNIFI_HTTP_RETRIES` | `3` | Number of retry attempts |
-| `UNIFI_RETRY_BACKOFF_BASE` | `1.0` | Initial retry delay (seconds) |
-| `UNIFI_RETRY_BACKOFF_MAX` | `30.0` | Maximum retry delay (seconds) |
+> **Warning**: This feature permanently deletes data from NetBox. Test thoroughly before enabling in production.
 
-------------------------------------------------------------------------
+Enable with `NETBOX_CLEANUP=true`. The cleanup phase runs after each sync and removes:
 
-### YAML Configuration
+| What | Description |
+|---|---|
+| **Stale devices** | Devices in NetBox not found in UniFi (after grace period) |
+| **Garbage interfaces** | Interfaces with `?` in the name |
+| **Orphan IPs** | IP addresses with no assigned object |
+| **Orphan cables** | Cables with missing terminations |
+| **Unused device types** | Device types with zero devices assigned |
 
-File: `config/config.yaml`
+The grace period (`CLEANUP_STALE_DAYS`, default 30) prevents deletion of temporarily offline devices. Set to `0` for immediate cleanup.
 
-```yaml
-UNIFI:
-  URLS:
-    - "https://unifi1.example.com"
-    - "https://unifi2.example.com"
-  USE_SITE_MAPPING: false
-  SITE_MAPPINGS:
-    "Default": "Main Office"
+See [docs/cleanup.md](docs/cleanup.md) for safety guidelines and best practices.
 
-NETBOX:
-  URL: "https://netbox.example.com"
-  TENANT: "My Organization"
-  ROLES:
-    GATEWAY: "Gateway"
-    ROUTER: "Router"
-    LAN: "Switch"
-    WIRELESS: "Access Point"
-    UNKNOWN: "Other"
-```
+---
 
-Environment variables take precedence over YAML values.
+## Continuous Sync
 
-------------------------------------------------------------------------
+The `SYNC_INTERVAL` variable controls how often the sync loop runs:
 
-### Site Mapping
+| Value | Behavior |
+|---|---|
+| `0` | Run once and exit (for cron or systemd timer) |
+| `600` | Every 10 minutes (recommended for Docker) |
+| `300` | Every 5 minutes |
+| `3600` | Every hour |
 
-File: `config/site_mapping.yaml`
+Between runs, per-run caches are cleared to ensure fresh data.
 
-Maps UniFi site names to NetBox site names when they differ:
-
-```yaml
-"UniFi Site Name": "NetBox Site Name"
-"Corporate Office": "HQ"
-"Remote Branch": "Branch-01"
-```
-
-Enable with `UNIFI_USE_SITE_MAPPING=true`.
-
-------------------------------------------------------------------------
-
-## Feature Reference
-
-### Device Synchronization
-
-For each online UniFi device:
-
-1. Extract serial, MAC, model, firmware, IP, and site
-2. Look up existing device in NetBox by serial (primary) or custom
-   field `unifi_mac` (secondary)
-3. If found → update fields (name, firmware, IP, etc.)
-4. If not found → create new device
-
-Custom fields synced:
-
-- `unifi_mac` — Device MAC address
-- `unifi_firmware` — Firmware version
-- `unifi_uptime` — Uptime in seconds
-- `unifi_last_seen` — Last seen timestamp
-
-Offline/disconnected devices are skipped during creation but existing
-devices remain in NetBox (see [Stale Device Cleanup](#stale-device-cleanup)).
-
-Manufacturer is auto-created as "Ubiquiti" if missing.
-
-------------------------------------------------------------------------
-
-### Device Type Specs Sync
-
-Every device type is checked against a built-in hardware database
-(`UNIFI_MODEL_SPECS`) containing ~40 UniFi models with:
-
-- **Part number** (e.g. `USW-Pro-48-PoE`)
-- **U height** (0 for desktop/wall-mount, 1 for rack-mount)
-- **Port definitions** with correct interface types and counts
-- **PoE budget** (stored as a comment)
-
-On each run:
-
-1. Device type metadata (part number, u_height, PoE comment) is
-   updated if incorrect
-2. Interface templates are compared against specs
-3. If templates don't match → all existing templates are deleted and
-   recreated from specs
-4. Duplicate templates are cleaned up automatically
-5. Each device type is processed only once per run (thread-safe)
-
-This ensures NetBox device types accurately reflect the physical
-hardware (port count, port types like 1000base-t, 10gbase-x-sfpp,
-25gbase-x-sfp28, etc.).
-
-------------------------------------------------------------------------
-
-### Interface Synchronization
-
-When `SYNC_INTERFACES=true`:
-
-**Physical ports:**
-
-- Syncs port name, enabled state, speed, PoE mode, MAC, and
-  description
-- Creates new interfaces if missing; updates existing if properties
-  changed
-- Cleans up invalid interfaces (names containing "?")
-
-**Radio interfaces (APs only):**
-
-- Syncs radio name, enabled state, and description
-- Only processed for devices detected as access points
-
-**API compatibility:**
-
-- Integration API: fetches detailed port/radio data via device-detail
-  endpoint
-- Legacy API: uses `port_table` / `radio_table` from device response
-
-------------------------------------------------------------------------
-
-### IP Address Handling
-
-1. Look up prefix in NetBox matching the device IP
-2. If VRF is configured → filter by VRF
-3. Derive subnet mask from matched prefix
-4. If IP changed:
-   - Delete old IP object
-   - Create new IP with correct CIDR notation
-5. Assign to management interface
-6. Set as `primary_ip4`
-
-------------------------------------------------------------------------
-
-### DHCP-to-Static IP Conversion
-
-When DHCP ranges are available (auto-discovered from UniFi and/or
-manually configured via `DHCP_RANGES`):
-
-1. If device IP falls within a DHCP range:
-   - Check if device already has a static IP in NetBox → keep it
-   - Otherwise, find an available static IP from the same prefix but
-     outside the DHCP pool
-   - Candidate IP is verified via ping (must not respond)
-   - Candidate must not be used by other UniFi devices
-   - Candidate must not already exist in NetBox
-   - Up to 10 candidates are checked
-2. Routers/gateways are exempt (they manage their own IPs)
-
-------------------------------------------------------------------------
-
-### VRF Handling
-
-VRF names match site names. Behavior depends on `NETBOX_VRF_MODE`:
-
-| Mode | VRF exists | VRF missing |
-|---|---|---|
-| `none` | Not used | Not used |
-| `existing` (default) | Used | Ignored (no VRF) |
-| `create` | Used | Created automatically |
-
-VRFs are cached per site to avoid duplicate API calls. Thread-safe
-with per-VRF locking to prevent duplicate creation.
-
-------------------------------------------------------------------------
-
-### VLAN / WLAN Synchronization
-
-When `SYNC_VLANS=true`:
-
-- UniFi networks are mapped to NetBox VLAN objects
-- Existing VLANs are looked up before creation
-- No destructive deletion
-
-When `SYNC_WLANS=true`:
-
-- UniFi WLAN definitions are imported into NetBox
-
-------------------------------------------------------------------------
-
-### Uplink Cable Synchronization
-
-When `SYNC_CABLES=true`, after all devices are synced:
-
-**Online devices:**
-
-1. Read uplink data from UniFi device detail API
-2. Find upstream device by UUID or MAC
-3. Match interfaces on both sides:
-   - Source: uplink port name, or interface marked "uplink", or last
-     physical port
-   - Target: remote port name if provided, or first unconnected
-     physical port
-4. Create cable in NetBox (status: connected)
-5. For APs with no physical ports: auto-creates `eth0` (1000base-t)
-   interface
-
-**Offline devices:**
-
-- All existing cables are removed from the device's interfaces
-- No new cables are created
-
-Cable sync is thread-safe using a dedicated lock.
-
-------------------------------------------------------------------------
-
-### Stale Device Cleanup
-
-When `SYNC_STALE_CLEANUP=true`:
-
-- Compares NetBox devices against current UniFi inventory per site
-- Devices present in NetBox but missing from UniFi are marked as
-  `status: offline`
-- **No devices are deleted** — they can recover if they come back
-  online
-
-------------------------------------------------------------------------
+---
 
 ## Supported Hardware
 
-The built-in hardware database includes interface templates and specs
-for:
+The bundled database covers **173 Ubiquiti models** including switches, gateways, access points, and UISP/airMAX devices.
 
-**Switches:**
+The hardcoded specs (`UNIFI_MODEL_SPECS`) include detailed port definitions for ~47 commonly deployed models. All 173 models from the community library get full interface/console/power port templates.
 
-| Model Code | Part Number | Ports |
-|---|---|---|
-| US8P60 | US-8-60W | 8× GbE, PoE 60W |
-| US8P150 | US-8-150W | 8× GbE + 2× SFP, PoE 150W |
-| US16P150 | US-16-150W | 16× GbE + 2× SFP, PoE 150W |
-| US24P250 | US-24-250W | 24× GbE + 2× SFP, PoE 250W |
-| USW Pro 48 PoE | USW-Pro-48-PoE | 48× GbE + 4× SFP+, PoE 600W |
-| USW Pro 8 PoE | USW-Pro-8-PoE | 8× GbE + 2× SFP+, PoE 120W |
-| USPM16P | USW-Pro-Max-16-PoE | 16× 2.5GbE + 2× SFP+, PoE 180W |
-| USPM24P | USW-Pro-Max-24-PoE | 16× GbE + 8× 2.5GbE + 2× SFP+, PoE 400W |
-| USW Aggregation | USW-Aggregation | 8× SFP+ |
-| USW Pro Aggregation | USW-Pro-Aggregation | 28× SFP+ + 4× SFP28 |
-| USW Flex Mini | USW-Flex-Mini | 5× GbE |
-| USW Enterprise 8 PoE | USW-Enterprise-8-PoE | 8× 2.5GbE + 2× SFP+, PoE 120W |
-| US XG 16 | US-XG-16 | 4× 10GbE + 12× SFP+ |
+Devices not in either database are still synced — they just won't have pre-configured templates.
 
-**Gateways:**
+See [docs/device-specs.md](docs/device-specs.md) for the full list.
 
-| Model Code | Part Number | Ports |
-|---|---|---|
-| UXGPRO / Gateway Pro | UXG-Pro | 2× GbE WAN + 2× SFP+ LAN |
+---
 
-**Access Points:**
-
-| Model Code | Part Number | Ports |
-|---|---|---|
-| U7LT / UAP-AC-Lite | UAP-AC-Lite | 1× GbE (eth0) |
-| U7MSH / AC Mesh | UAP-AC-M | 1× GbE (eth0) |
-| UAL6 / U6 Lite | U6-Lite | 1× GbE (eth0) |
-| UFLHD / FlexHD | UAP-FlexHD | 1× GbE (eth0) |
-
-**UISP / airMAX:**
-
-| Model Code | Part Number | Ports |
-|---|---|---|
-| Rocket Prism 5AC Gen2 | RP-5AC-Gen2 | 1× GbE (eth0) |
-| LiteAP AC | LAP-120 | 1× GbE (eth0) |
-| LiteBeam 5AC Gen2 | LBE-5AC-Gen2 | 1× GbE (eth0) |
-| Nanostation 5AC | NS-5AC | 1× GbE (eth0) |
-
-Devices not in the database are still synced — they just won't have
-pre-configured interface templates.
-
-------------------------------------------------------------------------
-
-## Threading Model
+## Architecture
 
 ```
-Controller Thread Pool (MAX_CONTROLLER_THREADS=5)
-  └── Site Thread Pool (MAX_SITE_THREADS=8)
-        └── Device Thread Pool (MAX_DEVICE_THREADS=8)
+UniFi Controller(s)
+  ↓ (Integration API v1 or Legacy API)
+UniFi API wrapper (unifi/)
+  ↓
+Normalization & Mapping (main.py)
+  ↓ (pynetbox)
+NetBox API
 ```
 
-HTTP connection pool: 50 connections.
+### Threading Model
 
-NetBox client initialized with `threading=True` for concurrent API
-calls.
+```
+Controller Pool (MAX_CONTROLLER_THREADS=5)
+  └── Site Pool (MAX_SITE_THREADS=8)
+        └── Device Pool (MAX_DEVICE_THREADS=8)
+```
 
-Thread-safe resources with dedicated locks:
+All thread limits are configurable via environment variables. HTTP connection pool: 50 connections. Thread-safe caches with dedicated locks for VRFs, custom fields, tags, VLANs, cables, and device type specs.
 
-- VRF cache and creation
-- Custom fields, tags, VLANs
-- Cable creation
-- DHCP ranges and static IP assignments
-- Device type specs sync
-- Postable fields cache
+### File Structure
 
-------------------------------------------------------------------------
+| File / Directory | Purpose |
+|---|---|
+| `main.py` | Core orchestration, sync, cleanup (~3000 lines) |
+| `unifi/` | UniFi API abstraction (Integration + Legacy) |
+| `config/` | YAML configuration and site mapping |
+| `data/` | Bundled community device specs (JSON) |
+| `tests/` | pytest test suite |
+| `lxc/` | LXC/Proxmox deployment scripts |
+| `docs/` | Extended documentation |
+| `.gitea/workflows/` | CI/CD pipeline |
 
-## Logging
+See [docs/architecture.md](docs/architecture.md) for deep-dive into threading, caching, and API flows.
 
-Default log level: **INFO** (verbose mode with `-v` flag).
+---
 
-Logs include:
+## Testing
 
-- Device creation/updates
-- Interface and template sync
-- VLAN/WLAN sync status
-- Cable creation/removal
-- Stale device marking
-- Device type spec updates
-- API errors and warnings
-
-Run with verbose logging:
+Run the test suite:
 
 ```bash
-python main.py -v
+pip install -r requirements.txt
+pytest tests/ -v
 ```
 
-Or via Docker (default in docker-compose.yml):
+48 tests covering:
+- Device helper functions (name, serial, MAC, IP extraction)
+- Community device specs (loading, lookup, merge)
+- Cleanup configuration (env var parsing)
 
-```bash
-docker compose up
-```
+---
 
-------------------------------------------------------------------------
+## Documentation
 
-## Data Safety Considerations
+- **[Configuration Reference](docs/configuration.md)** — all 37 env vars with examples
+- **[Cleanup Guide](docs/cleanup.md)** — safety guidelines for destructive cleanup
+- **[Device Specs](docs/device-specs.md)** — community specs, merge logic, custom models
+- **[Architecture](docs/architecture.md)** — threading, caching, API compatibility
+- **[Troubleshooting](docs/troubleshooting.md)** — common issues and solutions
+- **[FAQ](docs/faq.md)** — frequently asked questions
+- **[Changelog](CHANGELOG.md)** — version history
 
-- Old IP objects are deleted when IP changes
-- Stale devices are marked offline, **never deleted**
-- Cables on offline devices are removed automatically
-- No rollback if an API call partially fails
-- SSL verification is disabled by default
-- Script assumes valid prefix structure in NetBox
+---
 
-------------------------------------------------------------------------
+## Contributing
 
-## Deployment Recommendations
+1. Fork the repository
+2. Create a feature branch
+3. Write tests for new functionality
+4. Ensure `pytest tests/ -v` passes
+5. Submit a pull request
 
-- **Docker**: Use `restart: unless-stopped` for automatic recovery
-- **LXC/VM**: The systemd service restarts on failure with 30 s delay
-- Use a staging NetBox instance for initial testing
-- Monitor NetBox API response times
-- Start with lower thread counts for large environments (>1000
-  devices)
-- Enable SSL verification in production
-- Review `DHCP_RANGES` carefully before enabling
+The CI pipeline (Gitea Actions) runs syntax checks, tests, and Docker build on every push.
 
-------------------------------------------------------------------------
+---
 
-## Disclaimer
+## License
 
-This script performs direct write operations in NetBox via API.
-Validate configuration and test thoroughly before production use.
+[MIT License](LICENSE)
+
+---
+
+> **Disclaimer**: This tool performs direct write operations in NetBox via API. Validate configuration and test thoroughly before production use.
