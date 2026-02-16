@@ -122,7 +122,7 @@ HTTP tuning:
 - `UNIFI_RETRY_BACKOFF_BASE` (default 1.0)
 - `UNIFI_RETRY_BACKOFF_MAX` (default 30.0)
 
-Full reference: `docs/configuration.md`.
+Full reference: [`docs/configuration.md`](docs/configuration.md).
 
 ## Device Type Enrichment
 
@@ -139,7 +139,7 @@ Resulting enrichment can include:
 - power port templates and draw fields
 - part number and physical attributes
 
-Details: `docs/device-specs.md`.
+Details: [`docs/device-specs.md`](docs/device-specs.md).
 
 ## Cleanup
 
@@ -154,7 +154,7 @@ Cleanup tasks:
 - orphan cables (missing terminations)
 - unused Ubiquiti device types
 
-Safety guide: `docs/cleanup.md`.
+Safety guide: [`docs/cleanup.md`](docs/cleanup.md).
 
 ## Testing
 
@@ -193,13 +193,13 @@ Current suite: **52 tests**.
 
 ## Documentation
 
-- `docs/configuration.md`
-- `docs/cleanup.md`
-- `docs/device-specs.md`
-- `docs/architecture.md`
-- `docs/troubleshooting.md`
-- `docs/faq.md`
-- `CHANGELOG.md`
+- [`docs/configuration.md`](docs/configuration.md)
+- [`docs/cleanup.md`](docs/cleanup.md)
+- [`docs/device-specs.md`](docs/device-specs.md)
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/troubleshooting.md`](docs/troubleshooting.md)
+- [`docs/faq.md`](docs/faq.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Security Note
 
