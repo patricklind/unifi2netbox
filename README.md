@@ -121,6 +121,9 @@ HTTP tuning:
 - `UNIFI_HTTP_RETRIES` (default 3)
 - `UNIFI_RETRY_BACKOFF_BASE` (default 1.0)
 - `UNIFI_RETRY_BACKOFF_MAX` (default 30.0)
+- `UNIFI_VERIFY_SSL` (default `true`)
+- `NETBOX_VERIFY_SSL` (default `true`)
+- `UNIFI_PERSIST_SESSION` (default `true`)
 
 Full reference: [`docs/configuration.md`](docs/configuration.md).
 
@@ -203,7 +206,11 @@ Current suite: **52 tests**.
 
 ## Security Note
 
-Current implementation sends UniFi and NetBox requests with TLS verification disabled (`verify=False` / `session.verify=False`). Validate this against your security requirements before production use.
+TLS verification is configurable per side:
+- `UNIFI_VERIFY_SSL` (default `true`)
+- `NETBOX_VERIFY_SSL` (default `true`)
+
+Set either to `false` only if you explicitly accept the risk (for example lab environments with self-signed certs).
 
 ## License
 

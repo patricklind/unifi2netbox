@@ -25,6 +25,8 @@ Environment variables always override YAML values.
 |---|---|---|---|
 | `UNIFI_API_KEY_HEADER` | No | auto-probe | Custom API key header; if omitted, standard headers are probed |
 | `UNIFI_MFA_SECRET` | No | unset | Optional TOTP for session login |
+| `UNIFI_VERIFY_SSL` | No | `true` | Verify UniFi TLS certificates |
+| `UNIFI_PERSIST_SESSION` | No | `true` | Persist UniFi session cache to `~/.unifi_session.json` |
 | `UNIFI_REQUEST_TIMEOUT` | No | `15` | Request timeout in seconds |
 | `UNIFI_HTTP_RETRIES` | No | `3` | Retry attempts for transient failures |
 | `UNIFI_RETRY_BACKOFF_BASE` | No | `1.0` | Exponential backoff base delay (seconds) |
@@ -62,6 +64,7 @@ UNIFI_URLS=https://ctrl1.example.com/proxy/network/integration/v1,https://ctrl2.
 | Variable | Required | Default in code | Description |
 |---|---|---|---|
 | `NETBOX_DEVICE_STATUS` | No | `offline` | Status for newly created devices |
+| `NETBOX_VERIFY_SSL` | No | `true` | Verify NetBox TLS certificates |
 | `NETBOX_SERIAL_MODE` | No | `mac` | `mac`, `unifi`, `id`, `none` |
 | `NETBOX_VRF_MODE` | No | `existing` | `none`, `existing`, `create` |
 

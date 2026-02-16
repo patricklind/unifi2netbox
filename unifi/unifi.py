@@ -75,6 +75,8 @@ class Unifi:
         self.api_style = None  # "integration" or "legacy"
         self.integration_api_base = None
         self.integration_auth_headers = {}
+        self.verify_ssl = self._read_env_bool("UNIFI_VERIFY_SSL", True)
+        self.persist_session = self._read_env_bool("UNIFI_PERSIST_SESSION", True)
         self.request_timeout = self._read_env_int(
             "UNIFI_REQUEST_TIMEOUT",
             self.DEFAULT_TIMEOUT,
@@ -134,6 +136,21 @@ class Unifi:
             return response.json()
         except (ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _read_env_bool(name, default):
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value == "":
+            return default
+        value = str(raw_value).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        logger.warning(
+            f"Invalid boolean value for {name}: {raw_value}. Using default {default}."
+        )
+        return default
 
     @staticmethod
     def _read_env_int(name, default, minimum=0):
@@ -412,7 +429,7 @@ class Unifi:
                     response = self.session.get(
                         info_url,
                         headers=headers,
-                        verify=False,
+                        verify=self.verify_ssl,
                         timeout=self.request_timeout,
                     )
                 except requests.exceptions.RequestException as err:
@@ -438,7 +455,7 @@ class Unifi:
                         sites_url,
                         headers=headers,
                         params={"offset": 0, "limit": 1},
-                        verify=False,
+                        verify=self.verify_ssl,
                         timeout=self.request_timeout,
                     )
                 except requests.exceptions.RequestException:
@@ -458,6 +475,9 @@ class Unifi:
 
     def save_session_to_file(self):
         """Save session data to file, grouped by base_url."""
+        if not self.persist_session:
+            logger.debug("UniFi session persistence disabled (UNIFI_PERSIST_SESSION=false).")
+            return
         logger.debug(f"Saving session data for {self.base_url}")
         self._session_data[self.base_url] = {
             "cookies": self.session.cookies.get_dict(),
@@ -466,20 +486,40 @@ class Unifi:
             "api_prefix": self.api_prefix,
             "api_style": self.api_style,
             "integration_api_base": self.integration_api_base,
-            "integration_auth_headers": self.integration_auth_headers,
         }
         with file_lock:
             logger.debug(f"Acquired file lock for {self.SESSION_FILE}")
-            with open(self.SESSION_FILE, "w") as f:
+            fd = os.open(
+                self.SESSION_FILE,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(fd, "w") as f:
                 json.dump(self._session_data, f)
+            try:
+                os.chmod(self.SESSION_FILE, 0o600)
+            except OSError as err:
+                logger.warning(f"Could not enforce session file permissions: {err}")
             logger.info(f"Session data for {self.base_url} saved to file.")
 
     def load_session_from_file(self):
         """Load session data from file for the current base_url."""
+        if not self.persist_session:
+            logger.debug("UniFi session persistence disabled (UNIFI_PERSIST_SESSION=false).")
+            return
         logger.debug(f"Checking for session file at {self.SESSION_FILE}")
         if not os.path.exists(self.SESSION_FILE):
             logger.debug("No session file found, will authenticate from scratch")
             return
+
+        try:
+            file_mode = os.stat(self.SESSION_FILE).st_mode & 0o777
+            if file_mode & 0o077:
+                logger.warning(
+                    f"UniFi session file {self.SESSION_FILE} permissions are too open ({oct(file_mode)})."
+                )
+        except OSError:
+            pass
 
         try:
             with open(self.SESSION_FILE, "r") as f:
@@ -508,10 +548,6 @@ class Unifi:
         if cached_style in {"legacy", "integration"}:
             self.api_style = cached_style
         self.integration_api_base = session_info.get("integration_api_base")
-        headers = session_info.get("integration_auth_headers")
-        if isinstance(headers, dict):
-            self.integration_auth_headers = headers
-
         self._refresh_session_metadata()
         logger.info(f"Loaded session data for {self.base_url} from file.")
 
@@ -533,7 +569,7 @@ class Unifi:
                 response = self.session.post(
                     login_url,
                     json=payload,
-                    verify=False,
+                    verify=self.verify_ssl,
                     timeout=self.request_timeout,
                 )
             except requests.exceptions.RequestException as err:
@@ -614,7 +650,7 @@ class Unifi:
 
             request_kwargs = {
                 "headers": headers,
-                "verify": False,
+                "verify": self.verify_ssl,
                 "timeout": self.request_timeout,
                 "params": params,
             }
@@ -715,7 +751,7 @@ class Unifi:
             }
             request_kwargs = {
                 "headers": headers,
-                "verify": False,
+                "verify": self.verify_ssl,
                 "timeout": self.request_timeout,
                 "params": params,
             }

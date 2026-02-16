@@ -9,7 +9,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="unifi2netbox" \
       org.opencontainers.image.description="Sync UniFi devices, interfaces, VLANs, WLANs and cables into NetBox" \
-      org.opencontainers.image.source="https://github.com/unifi2netbox/unifi2netbox"
+      org.opencontainers.image.source="https://github.com/patricklind/unifi2netbox"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

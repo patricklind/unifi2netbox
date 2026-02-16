@@ -77,7 +77,10 @@
 
 **Problem**: `InsecureRequestWarning` in logs.
 
-**Solution**: SSL verification is disabled by default for self-signed certificates. This is expected behavior in the current implementation. To enforce TLS verification, update both NetBox and UniFi request settings in `main.py` and `unifi/unifi.py`.
+**Solutions**:
+- Keep `UNIFI_VERIFY_SSL=true` and `NETBOX_VERIFY_SSL=true` in production
+- For self-signed lab setups, set one or both to `false` only if you accept the risk
+- Install a trusted CA on the host/container when possible instead of disabling verification
 
 ---
 

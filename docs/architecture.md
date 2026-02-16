@@ -80,7 +80,6 @@ Main thread-safe structures in `main.py`:
 
 ## Runtime Security-Relevant Defaults
 
-- UniFi requests currently use `verify=False`
-- NetBox `requests.Session` is also configured with `verify=False`
-
-If strict TLS validation is required, adjust implementation before production.
+- UniFi TLS verification is controlled by `UNIFI_VERIFY_SSL` (default `true`)
+- NetBox TLS verification is controlled by `NETBOX_VERIFY_SSL` (default `true`)
+- UniFi session persistence is controlled by `UNIFI_PERSIST_SESSION` (default `true`)

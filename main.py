@@ -232,7 +232,12 @@ def get_postable_fields(base_url, token, url_path):
         "Authorization": f"Token {token}",
         "Content-Type": "application/json",
     }
-    response = requests.options(url, headers=headers, verify=False, timeout=15)
+    response = requests.options(
+        url,
+        headers=headers,
+        verify=_netbox_verify_ssl(),
+        timeout=15,
+    )
     response.raise_for_status()  # Raise an error if the response is not successful
 
     # Extract the available POST fields from the API schema
@@ -410,6 +415,37 @@ def _parse_env_bool(raw_value, default=False):
     return default
 
 
+def _read_env_int(var_name, default, minimum=None):
+    raw_value = os.getenv(var_name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Invalid integer value for {var_name}: {raw_value}. Using default {default}."
+        )
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(
+            f"Value for {var_name} must be >= {minimum}. Using default {default}."
+        )
+        return default
+    return value
+
+
+def _unifi_verify_ssl():
+    return _parse_env_bool(os.getenv("UNIFI_VERIFY_SSL"), default=True)
+
+
+def _netbox_verify_ssl():
+    return _parse_env_bool(os.getenv("NETBOX_VERIFY_SSL"), default=True)
+
+
+def _sync_interval_seconds():
+    return _read_env_int("SYNC_INTERVAL", default=0, minimum=0)
+
+
 def _parse_env_list(var_name):
     raw_value = os.getenv(var_name)
     if raw_value is None or not str(raw_value).strip():
@@ -484,7 +520,12 @@ def _fetch_legacy_networkconf(unifi, site_obj):
         auth_headers = getattr(unifi, "integration_auth_headers", None) or {}
         headers.update(auth_headers)
 
-        resp = unifi.session.get(url, headers=headers, verify=False, timeout=unifi.request_timeout)
+        resp = unifi.session.get(
+            url,
+            headers=headers,
+            verify=getattr(unifi, "verify_ssl", _unifi_verify_ssl()),
+            timeout=unifi.request_timeout,
+        )
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, dict) and "data" in data:
@@ -617,7 +658,13 @@ def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips=None,
     headers = {"Authorization": f"Token {netbox_token}", "Accept": "application/json"}
 
     try:
-        resp = requests.get(url, headers=headers, params={"limit": max_attempts * 5}, verify=False, timeout=10)
+        resp = requests.get(
+            url,
+            headers=headers,
+            params={"limit": max_attempts * 5},
+            verify=_netbox_verify_ssl(),
+            timeout=10,
+        )
         resp.raise_for_status()
         candidates = resp.json()
     except Exception as e:
@@ -2717,15 +2764,12 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
 
 def _is_cleanup_enabled():
     """Check if cleanup is enabled via NETBOX_CLEANUP env var."""
-    return os.getenv("NETBOX_CLEANUP", "false").strip().lower() in ("true", "1", "yes")
+    return _parse_env_bool(os.getenv("NETBOX_CLEANUP"), default=False)
 
 
 def _cleanup_stale_days():
     """Get the stale device grace period in days."""
-    try:
-        return int(os.getenv("CLEANUP_STALE_DAYS", "30"))
-    except (ValueError, TypeError):
-        return 30
+    return _read_env_int("CLEANUP_STALE_DAYS", default=30, minimum=0)
 
 
 def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials):
@@ -2921,10 +2965,10 @@ if __name__ == "__main__":
     try:
         unifi_url_list = config['UNIFI']['URLS']
     except (KeyError, TypeError):
-        logger.exception("UniFi URL list is missing. Set UNIFI_URLS in .env or UNIFI.URLS in config.")
+        logger.error("UniFi URL list is missing. Set UNIFI_URLS in .env or UNIFI.URLS in config.")
         raise SystemExit(1)
     if not unifi_url_list:
-        logger.exception("UniFi URL list is empty. Set UNIFI_URLS in .env (comma-separated or JSON array).")
+        logger.error("UniFi URL list is empty. Set UNIFI_URLS in .env (comma-separated or JSON array).")
         raise SystemExit(1)
 
     unifi_username = os.getenv('UNIFI_USERNAME')
@@ -2934,21 +2978,21 @@ if __name__ == "__main__":
     unifi_api_key_header = os.getenv('UNIFI_API_KEY_HEADER')
 
     if not unifi_api_key and not (unifi_username and unifi_password):
-        logger.exception("Missing UniFi credentials. Set UNIFI_API_KEY or UNIFI_USERNAME + UNIFI_PASSWORD.")
+        logger.error("Missing UniFi credentials. Set UNIFI_API_KEY or UNIFI_USERNAME + UNIFI_PASSWORD.")
         raise SystemExit(1)
 
     # Connect to Netbox
     try:
         netbox_url = config['NETBOX']['URL']
     except (KeyError, TypeError):
-        logger.exception("NetBox URL is missing. Set NETBOX_URL in .env or NETBOX.URL in config.")
+        logger.error("NetBox URL is missing. Set NETBOX_URL in .env or NETBOX.URL in config.")
         raise SystemExit(1)
     if not netbox_url:
-        logger.exception("NetBox URL is empty. Set NETBOX_URL in .env.")
+        logger.error("NetBox URL is empty. Set NETBOX_URL in .env.")
         raise SystemExit(1)
     netbox_token = os.getenv('NETBOX_TOKEN')
     if not netbox_token:
-        logger.exception("Netbox token is missing from environment variables.")
+        logger.error("Netbox token is missing from environment variables.")
         raise SystemExit(1)
 
     # Create a custom HTTP session as this script will often exceed the default pool size of 10
@@ -2958,7 +3002,7 @@ if __name__ == "__main__":
     # Adjust connection pool size
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    session.verify = False
+    session.verify = _netbox_verify_ssl()
 
     logger.debug(f"Initializing NetBox API connection to: {netbox_url}")
     nb = pynetbox.api(netbox_url, token=netbox_token, threading=True)
@@ -2969,17 +3013,17 @@ if __name__ == "__main__":
     try:
         tenant_name = config['NETBOX']['TENANT']
     except (KeyError, TypeError):
-        logger.exception("NetBox tenant is missing. Set NETBOX_TENANT in .env or NETBOX.TENANT in config.")
+        logger.error("NetBox tenant is missing. Set NETBOX_TENANT in .env or NETBOX.TENANT in config.")
         raise SystemExit(1)
     if not tenant_name:
-        logger.exception("NetBox tenant is empty. Set NETBOX_TENANT in .env.")
+        logger.error("NetBox tenant is empty. Set NETBOX_TENANT in .env.")
         raise SystemExit(1)
 
     tenant = nb.tenancy.tenants.get(name=tenant_name)
 
     roles_config = config.get('NETBOX', {}).get('ROLES')
     if not isinstance(roles_config, dict) or not roles_config:
-        logger.exception(
+        logger.error(
             "NETBOX.ROLES is missing. Set NETBOX_ROLES JSON in .env "
             "or NETBOX_ROLE_<KEY> variables (e.g. NETBOX_ROLE_WIRELESS=AP)."
         )
@@ -3018,7 +3062,7 @@ if __name__ == "__main__":
             netbox_device_roles[normalized_key] = role_obj
 
     if not netbox_device_roles:
-        logger.exception("Could not load or create any roles from NETBOX roles configuration.")
+        logger.error("Could not load or create any roles from NETBOX roles configuration.")
         raise SystemExit(1)
 
     logger.debug("Fetching all NetBox sites")
@@ -3036,7 +3080,7 @@ if __name__ == "__main__":
             logger.info(f"Ubiquity manufacturer with ID {nb_ubiquity.id} successfully added to Netbox.")
 
     # Sync loop — run once or continuously based on SYNC_INTERVAL
-    sync_interval = int(os.getenv("SYNC_INTERVAL", "0"))
+    sync_interval = _sync_interval_seconds()
     import time as _time
     run_count = 0
     while True:
