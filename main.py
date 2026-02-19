@@ -48,6 +48,8 @@ _assigned_static_ips = set()
 _assigned_static_ips_lock = threading.Lock()
 _unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = threading.Lock()
+_unifi_network_info = {}               # site_id -> list of dicts: {network, gateway, dns}
+_unifi_network_info_lock = threading.Lock()
 _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
 _cleanup_serials_lock = threading.Lock()
 
@@ -565,6 +567,8 @@ def extract_dhcp_ranges_from_unifi(site_obj, unifi=None):
             logger.debug("Legacy API fallback returned no data")
             return networks_result
 
+    network_info_list = []
+
     for net in net_configs:
         net_name = net.get("name") or net.get("purpose") or "unknown"
 
@@ -583,8 +587,39 @@ def extract_dhcp_ranges_from_unifi(site_obj, unifi=None):
             networks_result.append(network)
             logger.debug(f"Found DHCP-enabled network '{net_name}': {subnet}")
 
+            # Extract gateway and DNS from network config
+            gateway = net.get("gateway_ip") or net.get("gateway") or None
+            dns_servers = []
+            for key in ("dhcpd_dns_1", "dhcpd_dns_2", "dhcpd_dns_3", "dhcpd_dns_4",
+                         "dhcpdDns1", "dhcpdDns2", "dhcpdDns3", "dhcpdDns4"):
+                val = net.get(key)
+                if val and str(val).strip():
+                    dns_servers.append(str(val).strip())
+            # Deduplicate while preserving order
+            seen_dns = set()
+            unique_dns = []
+            for d in dns_servers:
+                if d not in seen_dns:
+                    seen_dns.add(d)
+                    unique_dns.append(d)
+
+            network_info_list.append({
+                "network": network,
+                "gateway": gateway,
+                "dns": unique_dns,
+                "name": net_name,
+            })
+            if gateway or unique_dns:
+                logger.debug(f"Network '{net_name}': gateway={gateway}, dns={unique_dns}")
+
         except ValueError:
             logger.warning(f"Invalid subnet '{subnet}' in UniFi network config. Skipping.")
+
+    # Store network info globally for later gateway/DNS lookup
+    site_id = getattr(site_obj, "id", None) or getattr(site_obj, "_id", None)
+    if site_id and network_info_list:
+        with _unifi_network_info_lock:
+            _unifi_network_info[site_id] = network_info_list
 
     return networks_result
 
@@ -618,6 +653,33 @@ def is_ip_in_dhcp_range(ip_str):
     except ValueError:
         return False
     return any(addr in network for network in dhcp_ranges)
+
+
+def _get_network_info_for_ip(ip_str):
+    """Look up gateway and DNS servers for a given IP from cached UniFi network configs.
+
+    Returns (gateway, dns_servers) tuple.  Both may be None/empty if not found.
+    Falls back to env vars DEFAULT_GATEWAY / DEFAULT_DNS if UniFi data unavailable.
+    """
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None, []
+
+    # Search cached network info from all sites
+    with _unifi_network_info_lock:
+        for _site_id, info_list in _unifi_network_info.items():
+            for info in info_list:
+                if addr in info["network"]:
+                    return info.get("gateway"), info.get("dns", [])
+
+    # Fallback to env vars
+    env_gw = os.getenv("DEFAULT_GATEWAY", "").strip() or None
+    env_dns_raw = os.getenv("DEFAULT_DNS", "").strip()
+    env_dns = [d.strip() for d in env_dns_raw.split(",") if d.strip()] if env_dns_raw else []
+    if env_gw or env_dns:
+        logger.debug(f"Using env fallback for {ip_str}: gateway={env_gw}, dns={env_dns}")
+    return env_gw, env_dns
 
 
 def ping_ip(ip_str, count=2, timeout=1):
@@ -2448,11 +2510,15 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                     if static_ip:
                         logger.info(f"Reassigning {device_name} from DHCP {device_ip} to static {static_ip}")
                         new_ip = static_ip.split("/")[0]
-                        # Set static IP on UniFi device
+                        # Set static IP on UniFi device with gateway + DNS from network config
                         if unifi_site_obj:
                             subnet_mask_bits = int(static_ip.split("/")[1])
                             subnet_mask = str(ipaddress.IPv4Network(f"0.0.0.0/{subnet_mask_bits}").netmask)
-                            set_unifi_device_static_ip(unifi, unifi_site_obj, device, new_ip, subnet_mask=subnet_mask)
+                            gw, dns = _get_network_info_for_ip(new_ip)
+                            set_unifi_device_static_ip(
+                                unifi, unifi_site_obj, device, new_ip,
+                                subnet_mask=subnet_mask, gateway=gw, dns_servers=dns
+                            )
                         device_ip = new_ip
                     else:
                         logger.warning(f"No available static IP for {device_name}. Keeping DHCP IP {device_ip}.")
@@ -3090,6 +3156,7 @@ if __name__ == "__main__":
             _device_type_specs_done.clear()
             _cleanup_serials_by_site.clear()
             _unifi_dhcp_ranges.clear()
+            _unifi_network_info.clear()
 
         logger.info(f"=== Sync run #{run_count} starting ===")
 

@@ -97,8 +97,10 @@ YAML mapping file is also supported: `config/site_mapping.yaml`.
 |---|---|---|---|
 | `DHCP_AUTO_DISCOVER` | No | `true` | Discover DHCP ranges from UniFi network configs |
 | `DHCP_RANGES` | No | empty | Manual CIDRs, merged with discovered ranges |
+| `DEFAULT_GATEWAY` | No | empty | Fallback gateway if UniFi network config lacks one |
+| `DEFAULT_DNS` | No | empty | Fallback DNS servers (comma-separated) if UniFi lacks them |
 
-When a device IP is in a DHCP range, static replacement logic may assign a free IP from the same prefix (except gateways).
+When a device IP is in a DHCP range, static replacement logic assigns a free IP from the same prefix (except gateways). Gateway and DNS are read from UniFi's network config (`gateway_ip`, `dhcpd_dns_1-4`). If unavailable, `DEFAULT_GATEWAY` and `DEFAULT_DNS` env vars are used as fallback.
 
 ## Feature Toggles
 
