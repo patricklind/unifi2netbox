@@ -2000,7 +2000,7 @@ UNIFI_MODEL_SPECS = {
     # ── Gateways ──────────────────────────────────────────────
     "UXGPRO":       {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
     "Gateway Pro":  {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
-    "UXG Fiber":  {"part_number": "UXG-Fiber",              "u_height": 1, "ports": [("LAN1", "2.5gbase-t", 1), ("LAN2", "2.5gbase-t", 1),("LAN3", "2.5gbase-t", 1),("LAN4 (PoE)", "2.5gbase-t", 1),("WAN1", "10gbase-t", 1), ("WAN2", "10gbase-x-sfpp", 1),("LAN5", "10gbase-x-sfpp", 1)], "poe_budget": 30},
+    "UXG Fiber":  {"part_number": "UXG-Fiber",              "u_height": 1, "ports": [("Port 1", "2.5gbase-t", 1), ("Port 2", "2.5gbase-t", 1),("Port 3", "2.5gbase-t", 1),("Port 4 (PoE)", "2.5gbase-t", 1),("Port 5 (WAN)", "10gbase-t", 1), ("SFP+ 6 (WAN)", "10gbase-x-sfpp", 1),("SFP+ 7", "10gbase-x-sfpp", 1)], "poe_budget": 30},
     # ── Access Points ─────────────────────────────────────────
     "U7LT":         {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
     "UAP-AC-Lite":  {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
