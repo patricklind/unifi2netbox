@@ -4,11 +4,21 @@
 
 ### Does this tool write anything back to UniFi?
 
-No. Synchronization is one-way: **UniFi → NetBox**. The tool never modifies UniFi configuration.
+Mostly no. The primary sync direction is **UniFi → NetBox**.
+
+Exception: if DHCP-to-static conversion is enabled and a device is found in a DHCP range, the tool can update that device's IP configuration on UniFi to static.
 
 ### Which UniFi API should I use?
 
 **Integration API v1** is recommended. It uses API key authentication and provides structured data. Legacy API (username/password) is supported as a fallback for older controllers.
+
+### Can I use an API key from `unifi.ui.com`?
+
+Not directly. `unifi.ui.com` cloud API keys are different from local UniFi Network Integration API keys.
+
+For this project:
+- Use a local Integration API key with local Integration API endpoints when available, or
+- Use local username/password (legacy/session mode) against your controller base URL.
 
 ### How do I run against a legacy UniFi controller?
 
@@ -62,6 +72,10 @@ NETBOX_DEFAULT_VRF=Shared VRF Name
 ```
 `NETBOX_DEFAULT_VRF` overrides site-based VRF naming and applies one VRF name across imports.
 With `NETBOX_VRF_MODE=existing`, the VRF must already exist. With `create`, it will be created if missing.
+
+### Is a default VRF also applied to imported prefixes?
+
+No new prefixes are imported/created from UniFi by this tool. Prefixes are looked up in NetBox and used for IP assignment logic.
 
 ### How do I run the sync only once (not continuously)?
 

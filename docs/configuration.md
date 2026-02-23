@@ -19,6 +19,8 @@ Environment variables always override YAML values.
 
 \* Provide either API key or username/password.
 
+Note: `unifi.ui.com` cloud API keys are not equivalent to local UniFi Network Integration API keys.
+
 ## UniFi API Settings
 
 | Variable | Required | Default in code | Description |
@@ -58,6 +60,8 @@ Multiple controllers:
 ```bash
 UNIFI_URLS=https://ctrl1.example.com/proxy/network/integration/v1,https://ctrl2.example.com:8443
 ```
+
+If Integration API is unavailable, use local controller base URL + `UNIFI_USERNAME`/`UNIFI_PASSWORD`.
 
 ## NetBox Settings
 
@@ -102,6 +106,11 @@ YAML mapping file is also supported: `config/site_mapping.yaml`.
 | `DEFAULT_DNS` | No | empty | Fallback DNS servers (comma-separated) if UniFi lacks them |
 
 When a device IP is in a DHCP range, static replacement logic assigns a free IP from the same prefix (except gateways). Gateway and DNS are read from UniFi's network config (`gateway_ip`, `dhcpd_dns_1-4`). If unavailable, `DEFAULT_GATEWAY` and `DEFAULT_DNS` env vars are used as fallback.
+
+Important: DHCP-to-static conversion also updates the device IP configuration in UniFi (writeback for that specific flow).
+To avoid UniFi writeback entirely, disable DHCP conversion inputs:
+- `DHCP_AUTO_DISCOVER=false`
+- leave `DHCP_RANGES` unset/empty
 
 ## Feature Toggles
 

@@ -23,6 +23,7 @@ UniFi Controller(s)
   - or direct URL if already ending with `/integration/v1`
 - Header formats are auto-probed (`X-API-KEY`, `Authorization`, or custom `UNIFI_API_KEY_HEADER`)
 - `Sites` and resource pagination are handled with `offset`/`limit`
+- `unifi.ui.com` cloud API keys are not treated as local Integration API keys
 
 ### Session login (UniFi OS / legacy)
 
@@ -75,6 +76,7 @@ Main thread-safe structures in `main.py`:
 4. Per site:
    - sync devices
    - sync interfaces/VLANs/WLANs/cables (feature toggles)
+   - optional DHCP-to-static conversion (updates UniFi device IP config)
 5. Optional cleanup (`NETBOX_CLEANUP=true`)
 6. Repeat if `SYNC_INTERVAL > 0`
 

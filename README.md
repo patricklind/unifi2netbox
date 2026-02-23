@@ -2,7 +2,8 @@
 
 Production-focused synchronization from UniFi controllers to NetBox.
 
-Sync direction is one-way: **UniFi -> NetBox**.
+Sync direction is primarily **UniFi -> NetBox**.
+Exception: when DHCP-to-static conversion is enabled and triggered, the tool updates device IP config on UniFi.
 
 [Quick Start](#quick-start) • [Configuration](#configuration) • [Cleanup](#cleanup) • [Testing](#testing) • [Documentation](#documentation)
 
@@ -14,7 +15,7 @@ Sync direction is one-way: **UniFi -> NetBox**.
 | Auth methods | API key or username/password (optional MFA secret) |
 | Sync scope | Devices, interfaces, VLANs, WLANs, uplink cables, device type templates |
 | Deployment | Docker, Proxmox LXC helper, bare-metal/VM via systemd installer |
-| Test suite | 52 pytest tests |
+| Test suite | 94 pytest tests |
 
 ## Sync Scope
 
@@ -25,6 +26,7 @@ Sync direction is one-way: **UniFi -> NetBox**.
 | VLANs | Syncs VLANs from UniFi network data |
 | WLANs | Syncs SSIDs as wireless LAN objects |
 | Cables | Syncs uplink cable relationships |
+| IP behavior | Imports/updates primary IPs in NetBox; optional DHCP->static conversion can write static IP settings back to UniFi |
 | Device types | Enriches models with interface/console/power templates |
 
 ## Architecture
@@ -100,6 +102,7 @@ Environment variables override YAML.
 | Session login fallback | Controller base URL | Username/password (`UNIFI_USERNAME`, `UNIFI_PASSWORD`), optional `UNIFI_MFA_SECRET` |
 
 When API key mode is used, header candidates are probed automatically (`X-API-KEY`, `Authorization`, or custom `UNIFI_API_KEY_HEADER`).
+`unifi.ui.com` cloud API keys are not the same as local Network Application Integration API keys and are not supported as drop-in replacements here.
 
 ### Common Toggles
 
@@ -168,7 +171,7 @@ pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-Current suite: **52 tests**.
+Current suite: **94 tests**.
 
 ## Project Layout
 

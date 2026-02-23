@@ -21,9 +21,11 @@
 
 **Solutions**:
 - **Integration API**: verify `UNIFI_API_KEY` is valid and has read access
+- `unifi.ui.com` cloud API keys are not interchangeable with local Integration API keys
 - **Legacy API**: verify username/password, check if MFA is required (`UNIFI_MFA_SECRET`)
 - Session cookies may expire — the tool handles re-authentication automatically
 - Check if the API key has been revoked or rotated
+- If local Integration API is unavailable, switch to base controller URL + `UNIFI_USERNAME`/`UNIFI_PASSWORD`
 
 ---
 
