@@ -18,10 +18,23 @@ _dhcp_ranges_cache = None
 _dhcp_ranges_lock = threading.Lock()
 _assigned_static_ips = set()
 _assigned_static_ips_lock = threading.Lock()
+_exhausted_static_prefixes = set()  # Prefix IDs exhausted for static selection in current sync run
+_exhausted_static_prefixes_lock = threading.Lock()
+_static_prefix_locks = {}
+_static_prefix_locks_lock = threading.Lock()
 _unifi_dhcp_ranges = {}  # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = threading.Lock()
 _unifi_network_info = {}  # site_id -> list of dicts: {network, gateway, dns}
 _unifi_network_info_lock = threading.Lock()
+
+
+def _get_static_prefix_lock(prefix_key) -> threading.Lock:
+    with _static_prefix_locks_lock:
+        lock = _static_prefix_locks.get(prefix_key)
+        if lock is None:
+            lock = threading.Lock()
+            _static_prefix_locks[prefix_key] = lock
+    return lock
 
 
 def _parse_env_dhcp_ranges():
@@ -251,78 +264,108 @@ def find_available_static_ip(
     dhcp_ranges = get_all_dhcp_ranges()
     subnet_mask = prefix_obj.prefix.split("/")[1]
     prefix_id = prefix_obj.id
+    vrf_id = getattr(vrf, "id", None) if vrf is not None else None
+    prefix_key = f"{prefix_obj.prefix}|vrf:{vrf_id if vrf_id is not None else 'none'}"
     unifi_ips = unifi_device_ips or set()
 
-    netbox_url = os.getenv("NETBOX_URL", "").rstrip("/")
-    netbox_token = os.getenv("NETBOX_TOKEN", "")
-    url = f"{netbox_url}/api/ipam/prefixes/{prefix_id}/available-ips/"
-    headers = {"Authorization": f"Token {netbox_token}", "Accept": "application/json"}
+    with _get_static_prefix_lock(prefix_key):
+        # Avoid repeated expensive checks and warning spam for the same exhausted prefix within one run.
+        with _exhausted_static_prefixes_lock:
+            if prefix_key in _exhausted_static_prefixes:
+                logger.debug(
+                    f"Static IP candidate search already exhausted for prefix {prefix_obj.prefix} in this run."
+                )
+                return None
 
-    try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            params={"limit": max_attempts * 5},
-            verify=_netbox_verify_ssl(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        candidates = resp.json()
-    except Exception as e:
-        logger.error(f"Failed to query available IPs for prefix {prefix_obj.prefix}: {e}")
-        return None
-
-    if not isinstance(candidates, list):
-        logger.error(f"Unexpected response from available-ips endpoint: {type(candidates)}")
-        return None
-
-    attempts = 0
-    evaluated_candidates = 0
-    for candidate in candidates:
-        if attempts >= max_attempts:
-            break
-
-        candidate_addr = candidate.get("address", "")
-        candidate_ip = candidate_addr.split("/")[0]
+        netbox_url = os.getenv("NETBOX_URL", "").rstrip("/")
+        netbox_token = os.getenv("NETBOX_TOKEN", "")
+        url = f"{netbox_url}/api/ipam/prefixes/{prefix_id}/available-ips/"
+        headers = {"Authorization": f"Token {netbox_token}", "Accept": "application/json"}
 
         try:
-            addr = ipaddress.ip_address(candidate_ip)
-        except ValueError:
-            continue
+            resp = requests.get(
+                url,
+                headers=headers,
+                params={"limit": max_attempts * 5},
+                verify=_netbox_verify_ssl(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            candidates = resp.json()
+        except Exception as e:
+            logger.error(f"Failed to query available IPs for prefix {prefix_obj.prefix}: {e}")
+            return None
 
-        evaluated_candidates += 1
+        if not isinstance(candidates, list):
+            logger.error(f"Unexpected response from available-ips endpoint: {type(candidates)}")
+            return None
 
-        if any(addr in net for net in dhcp_ranges):
-            continue
+        attempts = 0
+        evaluated_candidates = 0
+        skipped_dhcp = 0
+        skipped_assigned = 0
+        skipped_unifi = 0
+        skipped_ping = 0
+        for candidate in candidates:
+            if attempts >= max_attempts:
+                break
 
-        with _assigned_static_ips_lock:
-            if candidate_ip in _assigned_static_ips:
-                logger.debug(f"Skipping {candidate_ip} — already being assigned this run")
+            candidate_addr = candidate.get("address", "")
+            candidate_ip = candidate_addr.split("/")[0]
+
+            try:
+                addr = ipaddress.ip_address(candidate_ip)
+            except ValueError:
                 continue
 
-        if candidate_ip in unifi_ips:
-            logger.debug(f"Skipping {candidate_ip} — already in use by a UniFi device")
-            continue
+            evaluated_candidates += 1
 
-        attempts += 1
-
-        if ping_ip(candidate_ip):
-            logger.warning(f"Candidate IP {candidate_ip} responds to ping — in use, skipping")
-            continue
-
-        with _assigned_static_ips_lock:
-            if candidate_ip in _assigned_static_ips:
+            if any(addr in net for net in dhcp_ranges):
+                skipped_dhcp += 1
                 continue
-            _assigned_static_ips.add(candidate_ip)
 
-        logger.info(f"Found available static IP: {candidate_ip}/{subnet_mask}")
-        return f"{candidate_ip}/{subnet_mask}"
+            with _assigned_static_ips_lock:
+                if candidate_ip in _assigned_static_ips:
+                    logger.debug(f"Skipping {candidate_ip} — already being assigned this run")
+                    skipped_assigned += 1
+                    continue
 
-    logger.warning(
-        f"Could not find available static IP in {prefix_obj.prefix} "
-        f"after {attempts} assignment attempts (evaluated {evaluated_candidates} candidates)"
-    )
-    return None
+            if candidate_ip in unifi_ips:
+                logger.debug(f"Skipping {candidate_ip} — already in use by a UniFi device")
+                skipped_unifi += 1
+                continue
+
+            attempts += 1
+
+            if ping_ip(candidate_ip):
+                logger.warning(f"Candidate IP {candidate_ip} responds to ping — in use, skipping")
+                skipped_ping += 1
+                continue
+
+            with _assigned_static_ips_lock:
+                if candidate_ip in _assigned_static_ips:
+                    continue
+                _assigned_static_ips.add(candidate_ip)
+
+            logger.info(f"Found available static IP: {candidate_ip}/{subnet_mask}")
+            return f"{candidate_ip}/{subnet_mask}"
+
+        with _exhausted_static_prefixes_lock:
+            _exhausted_static_prefixes.add(prefix_key)
+
+        if evaluated_candidates > 0 and attempts == 0 and skipped_dhcp == evaluated_candidates:
+            logger.info(
+                f"No static-IP candidates outside DHCP ranges for {prefix_obj.prefix} "
+                f"(evaluated={evaluated_candidates}). Keeping DHCP assignment."
+            )
+        else:
+            logger.warning(
+                f"Could not find available static IP in {prefix_obj.prefix} "
+                f"after {attempts} assignment attempts (evaluated {evaluated_candidates}, "
+                f"skipped_dhcp={skipped_dhcp}, skipped_assigned={skipped_assigned}, "
+                f"skipped_unifi={skipped_unifi}, skipped_ping={skipped_ping})"
+            )
+        return None
 
 
 def set_unifi_device_static_ip(

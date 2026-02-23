@@ -73,6 +73,10 @@ _dhcp_ranges_cache = ipam_helpers._dhcp_ranges_cache
 _dhcp_ranges_lock = ipam_helpers._dhcp_ranges_lock
 _assigned_static_ips = ipam_helpers._assigned_static_ips
 _assigned_static_ips_lock = ipam_helpers._assigned_static_ips_lock
+_exhausted_static_prefixes = ipam_helpers._exhausted_static_prefixes
+_exhausted_static_prefixes_lock = ipam_helpers._exhausted_static_prefixes_lock
+_static_prefix_locks = ipam_helpers._static_prefix_locks
+_static_prefix_locks_lock = ipam_helpers._static_prefix_locks_lock
 _unifi_dhcp_ranges = ipam_helpers._unifi_dhcp_ranges          # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = ipam_helpers._unifi_dhcp_ranges_lock
 _unifi_network_info = ipam_helpers._unifi_network_info         # site_id -> list of dicts: {network, gateway, dns}
@@ -1717,9 +1721,9 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                             )
                         device_ip = new_ip
                     else:
-                        logger.warning(f"No available static IP for {device_name}. Keeping DHCP IP {device_ip}.")
+                        logger.info(f"No available static IP for {device_name}. Keeping DHCP IP {device_ip}.")
                 else:
-                    logger.warning(f"No prefix found for DHCP IP {device_ip}. Keeping DHCP IP.")
+                    logger.info(f"No prefix found for DHCP IP {device_ip}. Keeping DHCP IP.")
         # --- End DHCP-to-static ---
 
         # get the prefix that this IP address belongs to
@@ -2360,8 +2364,12 @@ if __name__ == "__main__":
         if run_count > 1:
             _device_type_specs_done.clear()
             _cleanup_serials_by_site.clear()
+            _assigned_static_ips.clear()
             _unifi_dhcp_ranges.clear()
             _unifi_network_info.clear()
+            _exhausted_static_prefixes.clear()
+            with _static_prefix_locks_lock:
+                _static_prefix_locks.clear()
 
         logger.info(f"=== Sync run #{run_count} starting ===")
 
