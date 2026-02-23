@@ -8,6 +8,5 @@ services:
       - .env
     volumes:
       - ./logs:/app/logs
-      - ./config:/app/config:ro
     command: ["python", "main.py", "-v"]
     restart: unless-stopped

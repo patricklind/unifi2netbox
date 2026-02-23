@@ -57,7 +57,7 @@ python3 -m venv "${VENV_DIR}"
 # --------------------------------------------------------------------------
 # 5. Directory structure and permissions
 # --------------------------------------------------------------------------
-mkdir -p "${APP_DIR}/logs" "${APP_DIR}/config"
+mkdir -p "${APP_DIR}/logs"
 
 # Create .env from example if it does not exist yet
 if [ ! -f "${APP_DIR}/.env" ]; then
@@ -82,7 +82,6 @@ echo "============================================="
 echo ""
 echo "Next steps:"
 echo "  1. Edit ${APP_DIR}/.env with your credentials"
-echo "  2. (Optional) edit ${APP_DIR}/config/site_mapping.yaml"
-echo "  3. Start:  systemctl start unifi2netbox"
-echo "  4. Logs:   journalctl -u unifi2netbox -f"
+echo "  2. Start:  systemctl start unifi2netbox"
+echo "  3. Logs:   journalctl -u unifi2netbox -f"
 echo ""

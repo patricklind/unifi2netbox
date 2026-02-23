@@ -15,7 +15,7 @@ Exception: when DHCP-to-static conversion is enabled and triggered, the tool upd
 | Auth methods | API key or username/password (optional MFA secret) |
 | Sync scope | Devices, interfaces, VLANs, WLANs, uplink cables, device type templates |
 | Deployment | Docker, Proxmox LXC helper, bare-metal/VM via systemd installer |
-| Test suite | 94 pytest tests |
+| Test suite | 96 pytest tests |
 
 ## Sync Scope
 
@@ -77,11 +77,8 @@ journalctl -u unifi2netbox -f
 
 ## Configuration
 
-Configuration precedence:
+Configuration source:
 1. Environment variables (`.env`)
-2. YAML (`config/config.yaml`)
-
-Environment variables override YAML.
 
 ### Required Variables
 
@@ -134,7 +131,7 @@ Full reference: [`docs/configuration.md`](docs/configuration.md).
 ## Device Type Enrichment
 
 Runtime merge sources:
-- Hardcoded `UNIFI_MODEL_SPECS` in `main.py` (**42 models**)
+- Hardcoded `UNIFI_MODEL_SPECS` in `unifi/model_specs.py` (**46 models**)
 - Community bundle `data/ubiquiti_device_specs.json` (**173 by model**, **166 by part number**)
 
 Hardcoded fields override community values when both exist.
@@ -171,25 +168,27 @@ pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-Current suite: **94 tests**.
+Current suite: **96 tests**.
 
 ## Project Layout
 
 ```text
 .
 ├── main.py
+├── sync/
+│   ├── ipam.py
+│   ├── runtime_config.py
+│   └── vrf.py
 ├── unifi/
 │   ├── unifi.py
 │   ├── resources.py
 │   ├── sites.py
 │   ├── device.py
+│   ├── model_specs.py
 │   ├── networkconf.py
 │   └── wlanconf.py
 ├── data/
 │   └── ubiquiti_device_specs.json
-├── config/
-│   ├── config.yaml.SAMPLE
-│   └── site_mapping.yaml
 ├── docs/
 ├── tests/
 ├── lxc/

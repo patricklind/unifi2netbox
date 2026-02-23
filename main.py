@@ -6,17 +6,41 @@ from slugify import slugify
 import os
 import re
 import requests
-import subprocess
 import warnings
 import logging
 import pynetbox
 import ipaddress
-import yaml
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
 # Import the unifi module instead of defining the Unifi class
+from sync import ipam as ipam_helpers
+from sync import vrf as vrf_helpers
+from sync.ipam import (
+    _get_network_info_for_ip,
+    _parse_env_dhcp_ranges,
+    extract_dhcp_ranges_from_unifi,
+    find_available_static_ip,
+    get_all_dhcp_ranges,
+    is_ip_in_dhcp_range,
+    ping_ip,
+    set_unifi_device_static_ip,
+)
+from sync.runtime_config import (
+    _load_roles_from_env,
+    _netbox_verify_ssl,
+    _parse_env_bool,
+    _parse_env_list,
+    _parse_env_mapping,
+    _read_env_int,
+    _sync_interval_seconds,
+    _unifi_verify_ssl,
+    load_config,
+    load_runtime_config,
+)
+from sync.vrf import get_existing_vrf, get_or_create_vrf, get_vrf_for_site
 from unifi.unifi import Unifi
+from unifi.model_specs import UNIFI_MODEL_SPECS
 # Suppress only the InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
@@ -24,18 +48,19 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Threading limits (configurable via env vars)
-MAX_CONTROLLER_THREADS = int(os.getenv("MAX_CONTROLLER_THREADS", "5"))
-MAX_SITE_THREADS = int(os.getenv("MAX_SITE_THREADS", "8"))
-MAX_DEVICE_THREADS = int(os.getenv("MAX_DEVICE_THREADS", "8"))
+# Use guarded parsing to avoid startup crashes on invalid env values.
+MAX_CONTROLLER_THREADS = _read_env_int("MAX_CONTROLLER_THREADS", default=5, minimum=1)
+MAX_SITE_THREADS = _read_env_int("MAX_SITE_THREADS", default=8, minimum=1)
+MAX_DEVICE_THREADS = _read_env_int("MAX_DEVICE_THREADS", default=8, minimum=1)
 
-# Populated at runtime from NETBOX roles in env/config
+# Populated at runtime from NETBOX roles in environment variables
 netbox_device_roles = {}
 postable_fields_cache = {}
 postable_fields_lock = threading.Lock()
-vrf_cache = {}
-vrf_cache_lock = threading.Lock()
-vrf_locks = {}
-vrf_locks_lock = threading.Lock()
+vrf_cache = vrf_helpers.vrf_cache
+vrf_cache_lock = vrf_helpers.vrf_cache_lock
+vrf_locks = vrf_helpers.vrf_locks
+vrf_locks_lock = vrf_helpers.vrf_locks_lock
 # Caches for custom fields, tags, VLANs (thread-safe)
 _custom_field_cache = {}
 _custom_field_lock = threading.Lock()
@@ -44,197 +69,23 @@ _tag_lock = threading.Lock()
 _vlan_cache = {}
 _vlan_lock = threading.Lock()
 _cable_lock = threading.Lock()
-_dhcp_ranges_cache = None
-_dhcp_ranges_lock = threading.Lock()
-_assigned_static_ips = set()
-_assigned_static_ips_lock = threading.Lock()
-_unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
-_unifi_dhcp_ranges_lock = threading.Lock()
-_unifi_network_info = {}               # site_id -> list of dicts: {network, gateway, dns}
-_unifi_network_info_lock = threading.Lock()
+_dhcp_ranges_cache = ipam_helpers._dhcp_ranges_cache
+_dhcp_ranges_lock = ipam_helpers._dhcp_ranges_lock
+_assigned_static_ips = ipam_helpers._assigned_static_ips
+_assigned_static_ips_lock = ipam_helpers._assigned_static_ips_lock
+_unifi_dhcp_ranges = ipam_helpers._unifi_dhcp_ranges          # site_id -> list of IPv4Network
+_unifi_dhcp_ranges_lock = ipam_helpers._unifi_dhcp_ranges_lock
+_unifi_network_info = ipam_helpers._unifi_network_info         # site_id -> list of dicts: {network, gateway, dns}
+_unifi_network_info_lock = ipam_helpers._unifi_network_info_lock
 _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
 _cleanup_serials_lock = threading.Lock()
+_site_mapping_cache = {}
+_site_mapping_cache_lock = threading.Lock()
 
-
-def _normalize_text_value(raw_value) -> str:
-    """
-    Normalize a free-form text value:
-    - trim leading/trailing whitespace
-    - strip one pair of matching surrounding quotes ('...' or "...")
-    """
-    if raw_value is None:
-        return ""
-    text = str(raw_value).strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
-        text = text[1:-1].strip()
-    return text
-
-
-def _normalize_vrf_name(vrf_name: str) -> str:
-    """
-    Normalize VRF names so lookups are stable and do not create near-duplicates.
-    """
-    if vrf_name is None:
-        return ""
-    # Strip and collapse repeated whitespace.
-    return " ".join(_normalize_text_value(vrf_name).split())
-
-
-def _vrf_cache_key(vrf_name: str) -> str:
-    return _normalize_vrf_name(vrf_name).casefold()
-
-
-def _find_vrfs_by_name(nb, vrf_name: str):
-    """
-    Find matching VRFs by name.
-
-    Starts with exact-name API filter for efficiency.
-    Falls back to normalized case-insensitive scan to avoid duplicates when
-    historical data has casing/whitespace drift.
-    """
-    normalized = _normalize_vrf_name(vrf_name)
-    if not normalized:
-        return []
-
-    exact = list(nb.ipam.vrfs.filter(name=normalized))
-    if exact:
-        return exact
-
-    wanted_key = _vrf_cache_key(normalized)
-    matches = []
-    try:
-        for candidate in nb.ipam.vrfs.all():
-            candidate_name = getattr(candidate, "name", "")
-            if _vrf_cache_key(candidate_name) == wanted_key:
-                matches.append(candidate)
-    except Exception as e:
-        logger.debug(f"Failed VRF fallback scan for '{normalized}': {e}")
-
-    return matches
-
-
-def _get_vrf_lock(vrf_name: str) -> threading.Lock:
-    cache_key = _vrf_cache_key(vrf_name)
-    with vrf_locks_lock:
-        lock = vrf_locks.get(cache_key)
-        if lock is None:
-            lock = threading.Lock()
-            vrf_locks[cache_key] = lock
-    return lock
-
-
-def get_or_create_vrf(nb, vrf_name: str):
-    """
-    Get or create a VRF by name in a concurrency-safe way.
-
-    NetBox does not enforce VRF name uniqueness, so without a lock multiple
-    threads can create duplicates when processing devices in parallel.
-    """
-    normalized_name = _normalize_vrf_name(vrf_name)
-    if not normalized_name:
-        return None
-    cache_key = _vrf_cache_key(normalized_name)
-
-    with vrf_cache_lock:
-        cached = vrf_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    with _get_vrf_lock(normalized_name):
-        with vrf_cache_lock:
-            cached = vrf_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        existing = _find_vrfs_by_name(nb, normalized_name)
-        vrf = None
-        if existing:
-            # Pick the oldest (lowest id) to keep behavior stable when duplicates already exist.
-            vrf = sorted(existing, key=lambda item: item.id or 0)[0]
-            if len(existing) > 1:
-                logger.warning(
-                    f"Multiple VRFs with name {normalized_name} found. Using ID {vrf.id}."
-                )
-        else:
-            logger.debug(f"VRF {normalized_name} not found, creating new VRF")
-            try:
-                vrf = nb.ipam.vrfs.create({"name": normalized_name})
-                if vrf is not None:
-                    logger.info(f"VRF {normalized_name} with ID {vrf.id} successfully added to NetBox.")
-            except pynetbox.core.query.RequestError as e:
-                logger.warning(f"Failed to create VRF {normalized_name}: {e}. Trying to refetch.")
-                existing = _find_vrfs_by_name(nb, normalized_name)
-                if existing:
-                    vrf = sorted(existing, key=lambda item: item.id or 0)[0]
-
-        if vrf is not None:
-            with vrf_cache_lock:
-                vrf_cache[cache_key] = vrf
-        return vrf
-
-
-def get_existing_vrf(nb, vrf_name: str):
-    """Get a VRF by name (do not create)."""
-    normalized_name = _normalize_vrf_name(vrf_name)
-    if not normalized_name:
-        return None
-    cache_key = _vrf_cache_key(normalized_name)
-    with vrf_cache_lock:
-        cached = vrf_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    with _get_vrf_lock(normalized_name):
-        with vrf_cache_lock:
-            cached = vrf_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        existing = _find_vrfs_by_name(nb, normalized_name)
-        if not existing:
-            return None
-        vrf = sorted(existing, key=lambda item: item.id or 0)[0]
-        if len(existing) > 1:
-            logger.warning(f"Multiple VRFs with name {normalized_name} found. Using ID {vrf.id}.")
-        with vrf_cache_lock:
-            vrf_cache[cache_key] = vrf
-        return vrf
-
-
-def get_vrf_for_site(nb, site_name: str):
-    """
-    Decide VRF behavior based on env.
-
-    NETBOX_VRF_MODE:
-      - none/disabled/off: do not use VRF at all
-      - existing/get: use VRF if it exists, never create
-      - create/site (legacy behavior): create VRF if missing
-
-    NETBOX_DEFAULT_VRF:
-      - if set, this VRF name is used for all sites instead of site_name
-    """
-    site_name = _normalize_vrf_name(site_name)
-    mode = (os.getenv("NETBOX_VRF_MODE") or "existing").strip().lower()
-    if mode in {"none", "disabled", "off"}:
-        return None, mode
-
-    default_vrf_name = _normalize_vrf_name(os.getenv("NETBOX_DEFAULT_VRF", ""))
-    target_vrf_name = default_vrf_name or site_name
-
-    if not target_vrf_name:
-        return None, mode
-
-    if mode in {"create", "site"}:
-        vrf = get_or_create_vrf(nb, target_vrf_name)
-        return vrf, mode
-
-    if mode in {"existing", "get"}:
-        vrf = get_existing_vrf(nb, target_vrf_name)
-        return vrf, mode
-
-    logger.warning(f"Unknown NETBOX_VRF_MODE='{mode}'. Falling back to 'existing'.")
-    vrf = get_existing_vrf(nb, target_vrf_name)
-    return vrf, "existing"
+_ASSET_TAG_RE = re.compile(r"[-_]?(A?ID\d+)$", re.IGNORECASE)
+_MAC_WITH_SEP_RE = re.compile(r"(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$")
+_MAC_PLAIN_RE = re.compile(r"(?i)[0-9a-f]{12}$")
+_NON_HEX_RE = re.compile(r"[^0-9A-Fa-f]")
 
 def get_postable_fields(base_url, token, url_path):
     """
@@ -272,52 +123,30 @@ def get_postable_fields(base_url, token, url_path):
 
 def load_site_mapping(config=None):
     """
-    Load site mapping from configuration or YAML file.
+    Load site mapping from runtime config (environment-derived).
     Returns a dictionary mapping UniFi site names to NetBox site names.
-    
-    :param config: Configuration dictionary loaded from config.yaml
+
+    :param config: Runtime configuration dictionary
     :return: Dictionary mapping UniFi site names to NetBox site names
     """
-    # Initialize with empty mapping
-    site_mapping = {}
-    
-    # First check if config has site mappings defined directly
-    if config and 'UNIFI' in config and 'SITE_MAPPINGS' in config['UNIFI']:
-        logger.debug("Loading site mappings from config.yaml")
-        config_mappings = config['UNIFI']['SITE_MAPPINGS']
-        if config_mappings:
-            site_mapping.update(config_mappings)
-            logger.debug(f"Loaded {len(config_mappings)} site mappings from config.yaml")
-    
-    # Check if we should use the external mapping file
-    use_file_mapping = False
-    if config and 'UNIFI' in config and 'USE_SITE_MAPPING' in config['UNIFI']:
-        use_file_mapping = config['UNIFI']['USE_SITE_MAPPING']
-        
-    if use_file_mapping:
-        site_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', 'site_mapping.yaml')
-        logger.debug(f"Loading site mapping from file: {site_mapping_path}")
-        
-        # Check if file exists, if not create a default one
-        if not os.path.exists(site_mapping_path):
-            logger.warning(f"Site mapping file not found at {site_mapping_path}. Creating a default one.")
-            os.makedirs(os.path.dirname(site_mapping_path), exist_ok=True)
-            with open(site_mapping_path, 'w') as f:
-                f.write("# Site mapping configuration\n")
-                f.write("# Format: unifi_site_name: netbox_site_name\n")
-                f.write("\"Default\": \"Default\"\n")
-            
-        try:
-            with open(site_mapping_path, 'r') as f:
-                file_mapping = yaml.safe_load(f) or {}
-                logger.debug(f"Loaded {len(file_mapping)} mappings from site_mapping.yaml")
-                # Update the mapping with file values (config values take precedence)
-                for key, value in file_mapping.items():
-                    if key not in site_mapping:  # Don't overwrite config mappings
-                        site_mapping[key] = value
-        except Exception as e:
-            logger.error(f"Error loading site mapping file: {e}")
-    
+    unifi_cfg = config.get("UNIFI", {}) if isinstance(config, dict) else {}
+    config_mappings = unifi_cfg.get("SITE_MAPPINGS") if isinstance(unifi_cfg, dict) else None
+    normalized_config_items = tuple(
+        sorted((str(k), str(v)) for k, v in config_mappings.items())
+    ) if isinstance(config_mappings, dict) and config_mappings else ()
+    cache_key = normalized_config_items
+    with _site_mapping_cache_lock:
+        cached_mapping = _site_mapping_cache.get(cache_key)
+    if cached_mapping is not None:
+        return dict(cached_mapping)
+
+    site_mapping = dict(config_mappings) if isinstance(config_mappings, dict) else {}
+    if site_mapping:
+        logger.debug(f"Loaded {len(site_mapping)} site mappings from UNIFI_SITE_MAPPINGS.")
+
+    with _site_mapping_cache_lock:
+        _site_mapping_cache[cache_key] = dict(site_mapping)
+
     logger.debug(f"Final site mapping has {len(site_mapping)} entries")
     return site_mapping
 
@@ -327,7 +156,7 @@ def get_netbox_site_name(unifi_site_name, config=None):
     If no mapping exists, return the original name.
     
     :param unifi_site_name: The UniFi site name to look up
-    :param config: Configuration dictionary loaded from config.yaml
+    :param config: Runtime configuration dictionary
     :return: The corresponding NetBox site name or the original name if no mapping exists
     """
     site_mapping = load_site_mapping(config)
@@ -343,10 +172,7 @@ def prepare_netbox_sites(netbox_sites):
     :param netbox_sites: List of NetBox site objects.
     :return: A dictionary mapping NetBox site names to the original NetBox site objects.
     """
-    netbox_sites_dict = {}
-    for netbox_site in netbox_sites:
-        netbox_sites_dict[netbox_site.name] = netbox_site
-    return netbox_sites_dict
+    return {netbox_site.name: netbox_site for netbox_site in netbox_sites}
 
 def match_sites_to_netbox(ubiquity_desc, netbox_sites_dict, config=None):
     """
@@ -354,7 +180,7 @@ def match_sites_to_netbox(ubiquity_desc, netbox_sites_dict, config=None):
 
     :param ubiquity_desc: The description of the Ubiquity site.
     :param netbox_sites_dict: A dictionary mapping NetBox site names to site objects.
-    :param config: Configuration dictionary loaded from config.yaml
+    :param config: Runtime configuration dictionary
     :return: The matched NetBox site, or None if no match is found.
     """
     # Get the corresponding NetBox site name from the mapping
@@ -367,12 +193,12 @@ def match_sites_to_netbox(ubiquity_desc, netbox_sites_dict, config=None):
         logger.debug(f'Matched Ubiquity site "{ubiquity_desc}" to NetBox site "{netbox_site.name}"')
         return netbox_site
     
-    # If site mapping is enabled but no match found, provide more helpful message
+    # If site mapping exists but no match found, provide more helpful message
     if config and 'UNIFI' in config and ('USE_SITE_MAPPING' in config['UNIFI'] and config['UNIFI']['USE_SITE_MAPPING'] or 
                                         'SITE_MAPPINGS' in config['UNIFI'] and config['UNIFI']['SITE_MAPPINGS']):
-        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Add mapping in config.yaml or site_mapping.yaml.')
+        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Add mapping in UNIFI_SITE_MAPPINGS.')
     else:
-        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Enable site mapping in config.yaml if needed.')
+        logger.debug(f'No match found for Ubiquity site "{ubiquity_desc}". Set UNIFI_SITE_MAPPINGS in .env if needed.')
     return None
 
 def setup_logging(min_log_level=logging.INFO):
@@ -426,626 +252,6 @@ def setup_logging(min_log_level=logging.INFO):
 
     logging.info(f"Logging is set up. Minimum log level: {logging.getLevelName(min_log_level)}")
 
-def _parse_env_bool(raw_value: str | None, default: bool = False) -> bool:
-    if raw_value is None:
-        return default
-    value = str(raw_value).strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    logger.warning(f"Invalid boolean value '{raw_value}'. Using default {default}.")
-    return default
-
-
-def _read_env_int(var_name: str, default: int, minimum: int | None = None) -> int:
-    raw_value = os.getenv(var_name)
-    if raw_value is None or str(raw_value).strip() == "":
-        return default
-    try:
-        value = int(str(raw_value).strip())
-    except (TypeError, ValueError):
-        logger.warning(
-            f"Invalid integer value for {var_name}: {raw_value}. Using default {default}."
-        )
-        return default
-    if minimum is not None and value < minimum:
-        logger.warning(
-            f"Value for {var_name} must be >= {minimum}. Using default {default}."
-        )
-        return default
-    return value
-
-
-def _unifi_verify_ssl() -> bool:
-    return _parse_env_bool(os.getenv("UNIFI_VERIFY_SSL"), default=True)
-
-
-def _netbox_verify_ssl() -> bool:
-    return _parse_env_bool(os.getenv("NETBOX_VERIFY_SSL"), default=True)
-
-
-def _sync_interval_seconds() -> int:
-    return _read_env_int("SYNC_INTERVAL", default=0, minimum=0)
-
-
-def _parse_env_list(var_name: str) -> list[str] | None:
-    raw_value = os.getenv(var_name)
-    if raw_value is None or not str(raw_value).strip():
-        return None
-
-    value = str(raw_value).strip()
-    if value.startswith("["):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as err:
-            raise ValueError(f"{var_name} must be a JSON array or comma-separated list.") from err
-        if not isinstance(parsed, list):
-            raise ValueError(f"{var_name} JSON value must be an array.")
-        return [str(item).strip() for item in parsed if str(item).strip()]
-
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _parse_env_dhcp_ranges():
-    """Parse DHCP_RANGES env var into a list of ipaddress.IPv4Network objects. Cached."""
-    global _dhcp_ranges_cache
-    with _dhcp_ranges_lock:
-        if _dhcp_ranges_cache is not None:
-            return _dhcp_ranges_cache
-
-    raw_ranges = _parse_env_list("DHCP_RANGES")
-    if not raw_ranges:
-        with _dhcp_ranges_lock:
-            _dhcp_ranges_cache = []
-        return []
-
-    networks = []
-    for r in raw_ranges:
-        r = r.strip()
-        try:
-            networks.append(ipaddress.ip_network(r, strict=False))
-        except ValueError:
-            logger.warning(f"Invalid DHCP range '{r}' in DHCP_RANGES. Skipping.")
-
-    with _dhcp_ranges_lock:
-        _dhcp_ranges_cache = networks
-    logger.debug(f"Parsed {len(networks)} env DHCP ranges: {[str(n) for n in networks]}")
-    return networks
-
-
-def _fetch_legacy_networkconf(unifi, site_obj):
-    """Fetch network configs via Legacy API (has DHCP fields).
-
-    The Integration API does not return dhcpd_enabled / ip_subnet,
-    so we fall back to the Legacy REST endpoint which includes the
-    full DHCP server configuration.
-
-    Uses the existing session with API key headers.
-    """
-    # Determine the site code for Legacy API path
-    site_code = (
-        getattr(site_obj, "internal_reference", None)
-        or getattr(site_obj, "name", None)
-        or "default"
-    )
-    # Build Legacy endpoint — strip integration path to get base host
-    base = unifi.base_url
-    if "/proxy/network/integration" in base:
-        base = base.split("/proxy/network/integration")[0]
-    elif "/integration/" in base:
-        base = base.split("/integration/")[0]
-    url = f"{base}/proxy/network/api/s/{site_code}/rest/networkconf"
-
-    try:
-        # Reuse the auth headers discovered during Integration API setup
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        auth_headers = getattr(unifi, "integration_auth_headers", None) or {}
-        headers.update(auth_headers)
-
-        resp = unifi.session.get(
-            url,
-            headers=headers,
-            verify=getattr(unifi, "verify_ssl", _unifi_verify_ssl()),
-            timeout=unifi.request_timeout,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict) and "data" in data:
-                return data["data"]
-            if isinstance(data, list):
-                return data
-        else:
-            logger.debug(f"Legacy networkconf returned HTTP {resp.status_code} for site {site_code}")
-    except Exception as e:
-        logger.debug(f"Legacy networkconf fallback failed for site {site_code}: {e}")
-    return None
-
-
-def extract_dhcp_ranges_from_unifi(site_obj, unifi=None) -> list[ipaddress.IPv4Network]:
-    """Extract DHCP ranges from UniFi network configs for a site.
-
-    Returns a list of ipaddress.IPv4Network objects representing
-    subnets where DHCP is enabled.
-
-    For Integration API controllers (which lack DHCP fields), falls
-    back to the Legacy API endpoint automatically.
-    """
-    networks_result = []
-    try:
-        net_configs = site_obj.network_conf.all()
-    except Exception as e:
-        logger.warning(f"Could not fetch network configs for DHCP range extraction: {e}")
-        return networks_result
-
-    # Check if Integration API returned limited data (no dhcpd_enabled field)
-    if net_configs and "dhcpd_enabled" not in net_configs[0] and unifi:
-        logger.debug("Integration API lacks DHCP fields, falling back to Legacy API")
-        legacy_configs = _fetch_legacy_networkconf(unifi, site_obj)
-        if legacy_configs:
-            net_configs = legacy_configs
-        else:
-            logger.debug("Legacy API fallback returned no data")
-            return networks_result
-
-    network_info_list = []
-
-    for net in net_configs:
-        net_name = net.get("name") or net.get("purpose") or "unknown"
-
-        # Check if DHCP server is enabled on this network
-        dhcp_enabled = net.get("dhcpd_enabled") or net.get("dhcpdEnabled") or False
-        if not dhcp_enabled:
-            continue
-
-        # Get the subnet
-        subnet = net.get("ip_subnet") or net.get("subnet")
-        if not subnet:
-            continue
-
-        try:
-            network = ipaddress.ip_network(subnet, strict=False)
-            networks_result.append(network)
-            logger.debug(f"Found DHCP-enabled network '{net_name}': {subnet}")
-
-            # Extract gateway and DNS from network config
-            gateway = net.get("gateway_ip") or net.get("gateway") or None
-            dns_servers = []
-            for key in ("dhcpd_dns_1", "dhcpd_dns_2", "dhcpd_dns_3", "dhcpd_dns_4",
-                         "dhcpdDns1", "dhcpdDns2", "dhcpdDns3", "dhcpdDns4"):
-                val = net.get(key)
-                if val and str(val).strip():
-                    dns_servers.append(str(val).strip())
-            # Deduplicate while preserving order
-            seen_dns = set()
-            unique_dns = []
-            for d in dns_servers:
-                if d not in seen_dns:
-                    seen_dns.add(d)
-                    unique_dns.append(d)
-
-            network_info_list.append({
-                "network": network,
-                "gateway": gateway,
-                "dns": unique_dns,
-                "name": net_name,
-            })
-            if gateway or unique_dns:
-                logger.debug(f"Network '{net_name}': gateway={gateway}, dns={unique_dns}")
-
-        except ValueError:
-            logger.warning(f"Invalid subnet '{subnet}' in UniFi network config. Skipping.")
-
-    # Store network info globally for later gateway/DNS lookup
-    site_id = getattr(site_obj, "id", None) or getattr(site_obj, "_id", None)
-    if site_id and network_info_list:
-        with _unifi_network_info_lock:
-            _unifi_network_info[site_id] = network_info_list
-
-    return networks_result
-
-
-def get_all_dhcp_ranges() -> list[ipaddress.IPv4Network]:
-    """Return merged DHCP ranges from env var + all discovered UniFi sites."""
-    env_ranges = _parse_env_dhcp_ranges()
-    with _unifi_dhcp_ranges_lock:
-        unifi_ranges = []
-        for ranges in _unifi_dhcp_ranges.values():
-            unifi_ranges.extend(ranges)
-
-    # Deduplicate by network address
-    seen = set()
-    merged = []
-    for net in env_ranges + unifi_ranges:
-        key = str(net)
-        if key not in seen:
-            seen.add(key)
-            merged.append(net)
-    return merged
-
-
-def is_ip_in_dhcp_range(ip_str: str) -> bool:
-    """Return True if the given IP string falls within any configured or discovered DHCP range."""
-    dhcp_ranges = get_all_dhcp_ranges()
-    if not dhcp_ranges:
-        return False
-    try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    return any(addr in network for network in dhcp_ranges)
-
-
-def _get_network_info_for_ip(ip_str: str) -> tuple[str | None, list[str]]:
-    """Look up gateway and DNS servers for a given IP from cached UniFi network configs.
-
-    Returns (gateway, dns_servers) tuple.  Both may be None/empty if not found.
-    Falls back to env vars DEFAULT_GATEWAY / DEFAULT_DNS if UniFi data unavailable.
-    """
-    try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return None, []
-
-    # Search cached network info from all sites
-    with _unifi_network_info_lock:
-        for _site_id, info_list in _unifi_network_info.items():
-            for info in info_list:
-                if addr in info["network"]:
-                    return info.get("gateway"), info.get("dns", [])
-
-    # Fallback to env vars
-    env_gw = os.getenv("DEFAULT_GATEWAY", "").strip() or None
-    env_dns_raw = os.getenv("DEFAULT_DNS", "").strip()
-    env_dns = [d.strip() for d in env_dns_raw.split(",") if d.strip()] if env_dns_raw else []
-    if env_gw or env_dns:
-        logger.debug(f"Using env fallback for {ip_str}: gateway={env_gw}, dns={env_dns}")
-    return env_gw, env_dns
-
-
-def ping_ip(ip_str: str, count: int = 2, timeout: int = 1) -> bool:
-    """Ping an IP address. Returns True if host responds (IP in use), False if not."""
-    try:
-        # Linux (Docker container): -W for timeout in seconds
-        cmd = ["ping", "-c", str(count), "-W", str(timeout), ip_str]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=count * timeout + 5,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, Exception) as e:
-        logger.debug(f"Ping to {ip_str} failed/timed out: {e}")
-        return False
-
-
-def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips: set[str] | None = None, max_attempts: int = 10) -> str | None:
-    """
-    Find an available static IP in the given NetBox prefix that:
-    1. Is NOT within any configured DHCP range
-    2. Is NOT already used by any UniFi device
-    3. Is NOT already in NetBox
-    4. Does NOT respond to ping
-    Uses NetBox available-ips API. Returns IP string with mask (e.g. '192.168.1.5/24') or None.
-    """
-    dhcp_ranges = get_all_dhcp_ranges()
-    subnet_mask = prefix_obj.prefix.split("/")[1]
-    prefix_id = prefix_obj.id
-    unifi_ips = unifi_device_ips or set()
-
-    # Use direct HTTP GET to list available IPs without creating them
-    netbox_url = os.getenv("NETBOX_URL", "").rstrip("/")
-    netbox_token = os.getenv("NETBOX_TOKEN", "")
-    url = f"{netbox_url}/api/ipam/prefixes/{prefix_id}/available-ips/"
-    headers = {"Authorization": f"Token {netbox_token}", "Accept": "application/json"}
-
-    try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            params={"limit": max_attempts * 5},
-            verify=_netbox_verify_ssl(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        candidates = resp.json()
-    except Exception as e:
-        logger.error(f"Failed to query available IPs for prefix {prefix_obj.prefix}: {e}")
-        return None
-
-    if not isinstance(candidates, list):
-        logger.error(f"Unexpected response from available-ips endpoint: {type(candidates)}")
-        return None
-
-    attempts = 0
-    for candidate in candidates:
-        if attempts >= max_attempts:
-            break
-
-        candidate_addr = candidate.get("address", "")
-        candidate_ip = candidate_addr.split("/")[0]
-
-        try:
-            addr = ipaddress.ip_address(candidate_ip)
-        except ValueError:
-            continue
-
-        # Skip if candidate is in DHCP range
-        if any(addr in net for net in dhcp_ranges):
-            continue
-
-        # Skip if already being assigned in this run (thread-safe)
-        with _assigned_static_ips_lock:
-            if candidate_ip in _assigned_static_ips:
-                logger.debug(f"Skipping {candidate_ip} — already being assigned this run")
-                continue
-
-        # Skip if any UniFi device already uses this IP
-        if candidate_ip in unifi_ips:
-            logger.debug(f"Skipping {candidate_ip} — already in use by a UniFi device")
-            continue
-
-        attempts += 1
-
-        # Ping check — skip if IP responds
-        if ping_ip(candidate_ip):
-            logger.warning(f"Candidate IP {candidate_ip} responds to ping — in use, skipping")
-            continue
-
-        # Reserve this IP to prevent concurrent assignment
-        with _assigned_static_ips_lock:
-            if candidate_ip in _assigned_static_ips:
-                continue  # Another thread grabbed it while we were pinging
-            _assigned_static_ips.add(candidate_ip)
-
-        logger.info(f"Found available static IP: {candidate_ip}/{subnet_mask}")
-        return f"{candidate_ip}/{subnet_mask}"
-
-    logger.warning(f"Could not find available static IP in {prefix_obj.prefix} after {attempts} attempts")
-    return None
-
-
-def set_unifi_device_static_ip(unifi, site_obj, device: dict, static_ip: str, subnet_mask: str = "255.255.252.0", gateway: str | None = None, dns_servers: list[str] | None = None) -> bool:
-    """
-    Set a static IP on a UniFi device via the controller API.
-    For Integration API: PATCH /sites/{siteId}/devices/{deviceId}
-    For Legacy API: PUT /api/s/{site}/rest/device/{id}
-    """
-    device_id = device.get("id") or device.get("_id")
-    device_name = get_device_name(device)
-    if not device_id:
-        logger.warning(f"Cannot set static IP on {device_name}: no device ID")
-        return False
-
-    site_api_id = getattr(site_obj, "api_id", None) or getattr(site_obj, "_id", None)
-    if not site_api_id:
-        logger.warning(f"Cannot set static IP on {device_name}: no site API ID")
-        return False
-
-    # Determine gateway from prefix if not provided
-    if not gateway:
-        try:
-            network = ipaddress.ip_network(f"{static_ip}/{subnet_mask}", strict=False)
-            gateway = str(list(network.hosts())[0])  # First host in subnet
-        except Exception as e:
-            gateway = static_ip.rsplit(".", 1)[0] + ".1"  # Fallback: x.x.x.1
-            logger.debug(f"Could not compute gateway from prefix, using fallback {gateway}: {e}")
-
-    api_style = getattr(unifi, "api_style", "legacy")
-    if api_style == "integration":
-        url = f"/sites/{site_api_id}/devices/{device_id}"
-        ip_config = {
-            "mode": "static",
-            "ip": static_ip,
-            "subnetMask": subnet_mask,
-            "gateway": gateway,
-        }
-        if dns_servers:
-            if len(dns_servers) >= 1:
-                ip_config["preferredDns"] = dns_servers[0]
-            if len(dns_servers) >= 2:
-                ip_config["alternateDns"] = dns_servers[1]
-        payload = {"ipConfig": ip_config}
-        try:
-            response = unifi.make_request(url, "PATCH", data=payload)
-            if isinstance(response, dict):
-                status = response.get("statusCode") or response.get("status")
-                if status and int(status) >= 400:
-                    logger.warning(f"Failed to set static IP on {device_name} via Integration API: {response.get('message', response)}")
-                    return False
-            logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to set static IP on {device_name}: {e}")
-            return False
-    else:
-        # Legacy API: PUT /api/s/{site}/rest/device/{id}
-        config_network = {
-            "type": "static",
-            "ip": static_ip,
-            "netmask": subnet_mask,
-            "gateway": gateway,
-        }
-        if dns_servers:
-            if len(dns_servers) >= 1:
-                config_network["dns1"] = dns_servers[0]
-            if len(dns_servers) >= 2:
-                config_network["dns2"] = dns_servers[1]
-        payload = {"config_network": config_network}
-        try:
-            site_name = getattr(site_obj, "name", "default")
-            url = f"/api/s/{site_name}/rest/device/{device_id}"
-            response = unifi.make_request(url, "PUT", data=payload)
-            if isinstance(response, dict):
-                meta = response.get("meta", {})
-                if isinstance(meta, dict) and meta.get("rc") == "ok":
-                    logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
-                    return True
-                logger.warning(f"Failed to set static IP on {device_name} via legacy API: {response}")
-                return False
-            return False
-        except Exception as e:
-            logger.warning(f"Failed to set static IP on {device_name}: {e}")
-            return False
-
-
-def _parse_env_mapping(var_name: str) -> dict[str, str] | None:
-    raw_value = os.getenv(var_name)
-    if raw_value is None or not str(raw_value).strip():
-        return None
-
-    value = str(raw_value).strip()
-    if value.startswith("{"):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as err:
-            raise ValueError(f"{var_name} must be a JSON object or key=value pairs.") from err
-        if not isinstance(parsed, dict):
-            raise ValueError(f"{var_name} JSON value must be an object.")
-        return {
-            str(key).strip(): str(item).strip()
-            for key, item in parsed.items()
-            if str(key).strip() and str(item).strip()
-        }
-
-    mapping = {}
-    for pair in re.split(r"[;,]", value):
-        pair = pair.strip()
-        if not pair:
-            continue
-        if "=" in pair:
-            key, item = pair.split("=", 1)
-        elif ":" in pair:
-            key, item = pair.split(":", 1)
-        else:
-            raise ValueError(
-                f"{var_name} pair '{pair}' is invalid. Use key=value pairs separated by ',' or ';'."
-            )
-        key = key.strip()
-        item = item.strip()
-        if key and item:
-            mapping[key] = item
-    return mapping
-
-
-def _load_roles_from_env():
-    roles_from_mapping = _parse_env_mapping("NETBOX_ROLES")
-    if roles_from_mapping:
-        return {str(key).upper(): value for key, value in roles_from_mapping.items()}
-
-    prefix = "NETBOX_ROLE_"
-    roles = {}
-    for key, value in os.environ.items():
-        if not key.startswith(prefix):
-            continue
-        role_key = key[len(prefix):].strip().upper()
-        role_value = str(value).strip()
-        if role_key and role_value:
-            roles[role_key] = role_value
-    return roles or None
-
-
-def load_config(config_path="config/config.yaml"):
-    """
-    Reads configuration from YAML if present.
-    Returns empty config if file does not exist.
-    """
-    if not os.path.exists(config_path):
-        logger.debug(f"Configuration file not found at {config_path}. Using environment variables.")
-        return {}
-
-    with open(config_path, "r") as file:
-        try:
-            config = yaml.safe_load(file) or {}
-        except yaml.YAMLError as e:
-            raise Exception(f"Error reading configuration file: {e}")
-    if not isinstance(config, dict):
-        raise ValueError("Configuration file must contain a top-level mapping.")
-    return config
-
-
-def load_runtime_config(config_path="config/config.yaml"):
-    """
-    Build runtime config from YAML + environment variables.
-    Environment variables take precedence.
-    """
-    config = load_config(config_path)
-
-    unifi_cfg = dict(config.get("UNIFI") or {})
-    netbox_cfg = dict(config.get("NETBOX") or {})
-
-    env_unifi_urls = _parse_env_list("UNIFI_URLS")
-    if env_unifi_urls is not None:
-        unifi_cfg["URLS"] = env_unifi_urls
-
-    env_use_site_mapping = os.getenv("UNIFI_USE_SITE_MAPPING")
-    if env_use_site_mapping is not None:
-        unifi_cfg["USE_SITE_MAPPING"] = _parse_env_bool(env_use_site_mapping, default=False)
-
-    env_site_mappings = _parse_env_mapping("UNIFI_SITE_MAPPINGS")
-    if env_site_mappings is not None:
-        unifi_cfg["SITE_MAPPINGS"] = env_site_mappings
-
-    env_netbox_url = os.getenv("NETBOX_URL")
-    if env_netbox_url:
-        netbox_cfg["URL"] = _normalize_text_value(env_netbox_url)
-
-    env_netbox_import_tenant = _normalize_text_value(os.getenv("NETBOX_IMPORT_TENANT"))
-    env_netbox_tenant = _normalize_text_value(os.getenv("NETBOX_TENANT"))
-    if env_netbox_import_tenant and env_netbox_tenant:
-        if env_netbox_import_tenant != env_netbox_tenant:
-            logger.warning(
-                "Both NETBOX_IMPORT_TENANT and NETBOX_TENANT are set with different values. "
-                "Using NETBOX_IMPORT_TENANT."
-            )
-    effective_tenant = env_netbox_import_tenant or env_netbox_tenant
-    if effective_tenant:
-        netbox_cfg["TENANT"] = effective_tenant
-
-    env_netbox_roles = _load_roles_from_env()
-    if env_netbox_roles:
-        netbox_cfg["ROLES"] = env_netbox_roles
-
-    if isinstance(unifi_cfg.get("URLS"), str):
-        unifi_cfg["URLS"] = [item.strip() for item in unifi_cfg["URLS"].split(",") if item.strip()]
-    if not isinstance(unifi_cfg.get("URLS"), list):
-        unifi_cfg["URLS"] = []
-    unifi_cfg["URLS"] = [str(item).strip() for item in unifi_cfg["URLS"] if str(item).strip()]
-
-    site_mappings = unifi_cfg.get("SITE_MAPPINGS")
-    if site_mappings is None:
-        site_mappings = {}
-    if not isinstance(site_mappings, dict):
-        raise ValueError("UNIFI.SITE_MAPPINGS must be a mapping.")
-    unifi_cfg["SITE_MAPPINGS"] = {
-        str(key).strip(): str(value).strip()
-        for key, value in site_mappings.items()
-        if str(key).strip() and str(value).strip()
-    }
-
-    use_site_mapping = unifi_cfg.get("USE_SITE_MAPPING", False)
-    if isinstance(use_site_mapping, str):
-        use_site_mapping = _parse_env_bool(use_site_mapping, default=False)
-    unifi_cfg["USE_SITE_MAPPING"] = bool(use_site_mapping)
-
-    roles_cfg = netbox_cfg.get("ROLES")
-    if roles_cfg is None:
-        roles_cfg = {}
-    if not isinstance(roles_cfg, dict):
-        raise ValueError("NETBOX.ROLES must be a mapping.")
-    netbox_cfg["ROLES"] = {
-        str(key).strip().upper(): str(value).strip()
-        for key, value in roles_cfg.items()
-        if str(key).strip() and str(value).strip()
-    }
-
-    runtime_config = {
-        "UNIFI": unifi_cfg,
-        "NETBOX": netbox_cfg,
-    }
-    return runtime_config
-
 def get_device_name(device: dict) -> str:
     return (
         device.get("name")
@@ -1060,7 +266,7 @@ def extract_asset_tag(device_name: str | None) -> str | None:
     """Extract ID or AID tag from device name, e.g. 'IT-AULA-AP02-ID3006' -> 'ID3006'."""
     if not device_name:
         return None
-    match = re.search(r'[-_]?(A?ID\d+)$', device_name, re.IGNORECASE)
+    match = _ASSET_TAG_RE.search(device_name)
     if match:
         return match.group(1).upper()
     return None
@@ -1089,8 +295,8 @@ def get_device_serial(device: dict) -> str | None:
         if not text:
             return None
         # If this is a MAC address (with separators) or 12 hex characters, normalize to compact uppercase.
-        if re.fullmatch(r"(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}", text) or re.fullmatch(r"(?i)[0-9a-f]{12}", text):
-            return re.sub(r"[^0-9A-Fa-f]", "", text).upper()
+        if _MAC_WITH_SEP_RE.fullmatch(text) or _MAC_PLAIN_RE.fullmatch(text):
+            return _NON_HEX_RE.sub("", text).upper()
         return text
 
     mode = (os.getenv("NETBOX_SERIAL_MODE") or "mac").strip().lower()
@@ -1987,65 +1193,6 @@ def select_netbox_role_for_device(device):
     return netbox_device_roles[first_key], first_key
 
 
-# ──────────────────────────────────────────────────────────────
-# UniFi device-type specs database
-# Maps UniFi model codes to hardware specifications for NetBox.
-# Keys: model string as returned by UniFi API.
-# ──────────────────────────────────────────────────────────────
-UNIFI_MODEL_SPECS = {
-    # ── Switches ──────────────────────────────────────────────
-    "US8P60":       {"part_number": "US-8-60W",             "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 60},
-    "US 8 60W":     {"part_number": "US-8-60W",             "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 60},
-    "US8P150":      {"part_number": "US-8-150W",            "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
-    "US 8 PoE 150W":{"part_number": "US-8-150W",            "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
-    "US68P":        {"part_number": "USW-Lite-8-PoE",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 52},
-    "USLP8P":       {"part_number": "USW-Lite-8-PoE",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 52},
-    "US16P150":     {"part_number": "US-16-150W",           "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
-    "US 16 PoE 150W":{"part_number": "US-16-150W",          "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 150},
-    "US24P250":     {"part_number": "US-24-250W",           "u_height": 1, "ports": [("Port {n}", "1000base-t", 24), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 250},
-    "US 24 PoE 250W":{"part_number": "US-24-250W",          "u_height": 1, "ports": [("Port {n}", "1000base-t", 24), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 250},
-    "US48PRO":      {"part_number": "USW-Pro-48-PoE",       "u_height": 1, "ports": [("Port {n}", "1000base-t", 48), ("SFP+ {n}", "10gbase-x-sfpp", 4)], "poe_budget": 600},
-    "USW Pro 48 PoE":{"part_number": "USW-Pro-48-PoE",      "u_height": 1, "ports": [("Port {n}", "1000base-t", 48), ("SFP+ {n}", "10gbase-x-sfpp", 4)], "poe_budget": 600},
-    "US6XG150":     {"part_number": "US-XG-6POE",           "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 150},
-    "US XG 6 PoE":  {"part_number": "US-XG-6POE",           "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 150},
-    "USMINI":       {"part_number": "USW-Flex-Mini",        "u_height": 0, "ports": [("Port {n}", "1000base-t", 5)], "poe_budget": 0},
-    "USW Flex Mini": {"part_number": "USW-Flex-Mini",       "u_height": 0, "ports": [("Port {n}", "1000base-t", 5)], "poe_budget": 0},
-    "USXG":         {"part_number": "USW-Aggregation",      "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 8)], "poe_budget": 0},
-    "USW Aggregation":{"part_number": "USW-Aggregation",    "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 8)], "poe_budget": 0},
-    "USAGGPRO":     {"part_number": "USW-Pro-Aggregation",  "u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 28), ("SFP28 {n}", "25gbase-x-sfp28", 4)], "poe_budget": 0},
-    "USW Pro Aggregation":{"part_number": "USW-Pro-Aggregation","u_height": 1, "ports": [("SFP+ {n}", "10gbase-x-sfpp", 28), ("SFP28 {n}", "25gbase-x-sfp28", 4)], "poe_budget": 0},
-    "USL8A":        {"part_number": "USW-Lite-8",           "u_height": 0, "ports": [("Port {n}", "1000base-t", 8)], "poe_budget": 0},
-    "USPM16P":      {"part_number": "USW-Pro-Max-16-PoE",   "u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 16), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 180},
-    "USW Pro Max 16 PoE":{"part_number": "USW-Pro-Max-16-PoE","u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 16), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 180},
-    "USPM24P":      {"part_number": "USW-Pro-Max-24-PoE",   "u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("Port {n+16}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 400},
-    "USW Pro Max 24 PoE":{"part_number": "USW-Pro-Max-24-PoE","u_height": 1, "ports": [("Port {n}", "1000base-t", 16), ("Port {n+16}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 400},
-    "USW Pro 8 PoE":{"part_number": "USW-Pro-8-PoE",        "u_height": 0, "ports": [("Port {n}", "1000base-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 120},
-    "USW Enterprise 8 PoE":{"part_number": "USW-Enterprise-8-PoE","u_height": 0, "ports": [("Port {n}", "2.5gbase-t", 8), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 120},
-    "US XG 16":     {"part_number": "US-XG-16",             "u_height": 1, "ports": [("Port {n}", "10gbase-t", 4), ("SFP+ {n}", "10gbase-x-sfpp", 12)], "poe_budget": 0},
-    "USW Enterprise 24 PoE":{"part_number": "USW-Enterprise-24-PoE","u_height": 1, "ports": [("Port {n}", "1000base-t", 12), ("Port {n+12}", "2.5gbase-t", 12), ("SFP+ {n}", "10gbase-x-sfpp", 2)], "poe_budget": 400},
-    "US 24":        {"part_number": "US-24",             "u_height": 1, "ports": [("Port {n}", "1000base-t", 24), ("SFP {n}", "1000base-x-sfp", 2)], "poe_budget": 0},
-    # ── Gateways ──────────────────────────────────────────────
-    "UXGPRO":       {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
-    "Gateway Pro":  {"part_number": "UXG-Pro",              "u_height": 1, "ports": [("WAN 1", "1000base-t", 1), ("WAN 2", "1000base-t", 1), ("LAN 1", "10gbase-x-sfpp", 1), ("LAN 2", "10gbase-x-sfpp", 1)], "poe_budget": 0},
-    "UXG Fiber":  {"part_number": "UXG-Fiber",              "u_height": 1, "ports": [("Port 1", "2.5gbase-t", 1), ("Port 2", "2.5gbase-t", 1),("Port 3", "2.5gbase-t", 1),("Port 4 (PoE)", "2.5gbase-t", 1),("Port 5 (WAN)", "10gbase-t", 1), ("SFP+ 6 (WAN)", "10gbase-x-sfpp", 1),("SFP+ 7", "10gbase-x-sfpp", 1)], "poe_budget": 30},
-    # ── Access Points ─────────────────────────────────────────
-    "U7LT":         {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "UAP-AC-Lite":  {"part_number": "UAP-AC-Lite",          "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "U7MSH":        {"part_number": "UAP-AC-M",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "AC Mesh":      {"part_number": "UAP-AC-M",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "UAL6":         {"part_number": "U6-LR",                "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "U6 Lite":      {"part_number": "U6-Lite",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "UFLHD":        {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "FlexHD":       {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "U7 Pro":       {"part_number": "U7-Pro",           "u_height": 0, "ports": [("Port 1", "2.5gbase-t", 1)], "poe_budget": 0},
-    # ── UISP / airMAX ────────────────────────────────────────
-    "Rocket Prism 5AC Gen2":{"part_number": "RP-5AC-Gen2",  "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "LiteAP AC":    {"part_number": "LAP-120",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "LiteBeam 5AC Gen2":{"part_number": "LBE-5AC-Gen2",    "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-    "Nanostation 5AC":{"part_number": "NS-5AC",             "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
-}
-
-
 _device_type_specs_done = set()
 _device_type_specs_lock = threading.Lock()
 
@@ -2345,35 +1492,51 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         logger.debug(f"Checking for existing device type: {device_model} (manufacturer ID: {nb_ubiquity.id})")
         nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquity.id)
         if not nb_device_type:
+            # Pre-populate from community specs when creating a new device type
+            specs = _resolve_device_specs(device_model)
+            create_data = {
+                "manufacturer": nb_ubiquity.id,
+                "model": device_model,
+                "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquity.name}-{device_model}'),
+            }
+            if specs:
+                if specs.get("part_number"):
+                    create_data["part_number"] = specs["part_number"]
+                if specs.get("u_height") is not None:
+                    create_data["u_height"] = specs["u_height"]
+                if specs.get("is_full_depth") is not None:
+                    create_data["is_full_depth"] = specs["is_full_depth"]
+                if specs.get("airflow"):
+                    create_data["airflow"] = specs["airflow"]
+                if specs.get("weight") is not None:
+                    try:
+                        create_data["weight"] = float(specs["weight"])
+                        create_data["weight_unit"] = specs.get("weight_unit", "kg")
+                    except (ValueError, TypeError):
+                        pass
             try:
-                # Pre-populate from community specs when creating a new device type
-                specs = _resolve_device_specs(device_model)
-                create_data = {
-                    "manufacturer": nb_ubiquity.id,
-                    "model": device_model,
-                    "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquity.name}-{device_model}'),
-                }
-                if specs:
-                    if specs.get("part_number"):
-                        create_data["part_number"] = specs["part_number"]
-                    if specs.get("u_height") is not None:
-                        create_data["u_height"] = specs["u_height"]
-                    if specs.get("is_full_depth") is not None:
-                        create_data["is_full_depth"] = specs["is_full_depth"]
-                    if specs.get("airflow"):
-                        create_data["airflow"] = specs["airflow"]
-                    if specs.get("weight") is not None:
-                        try:
-                            create_data["weight"] = float(specs["weight"])
-                            create_data["weight_unit"] = specs.get("weight_unit", "kg")
-                        except (ValueError, TypeError):
-                            pass
                 nb_device_type = nb.dcim.device_types.create(create_data)
                 if nb_device_type:
                     logger.info(f"Device type {device_model} with ID {nb_device_type.id} successfully added to NetBox.")
             except pynetbox.core.query.RequestError as e:
-                logger.error(f"Failed to create device type for {device_name} at site {site}: {e}")
-                return
+                error_message = str(e).lower()
+                if "duplicate key value violates unique constraint" in error_message:
+                    # Race condition guard: another worker may have created the same type just before us.
+                    nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquity.id)
+                    if not nb_device_type and create_data.get("part_number"):
+                        nb_device_type = nb.dcim.device_types.get(
+                            part_number=create_data["part_number"], manufacturer_id=nb_ubiquity.id
+                        )
+                    if nb_device_type:
+                        logger.debug(
+                            f"Device type {device_model} already exists after duplicate create error; reusing ID {nb_device_type.id}."
+                        )
+                    else:
+                        logger.error(f"Failed to recover duplicate device type for {device_name} at site {site}: {e}")
+                        return
+                else:
+                    logger.error(f"Failed to create device type for {device_name} at site {site}: {e}")
+                    return
         # Ensure device type has correct specs (ports, PoE, part number, etc.)
         ensure_device_type_specs(nb, nb_device_type, device_model)
 
@@ -3054,7 +2217,7 @@ if __name__ == "__main__":
     
     if args.verbose:
         logger.debug("Verbose logging enabled")
-    logger.debug("Loading runtime configuration (config file + environment)")
+    logger.debug("Loading runtime configuration from environment variables")
     try:
         config = load_runtime_config()
     except Exception as e:
@@ -3064,7 +2227,7 @@ if __name__ == "__main__":
     try:
         unifi_url_list = config['UNIFI']['URLS']
     except (KeyError, TypeError):
-        logger.error("UniFi URL list is missing. Set UNIFI_URLS in .env or UNIFI.URLS in config.")
+        logger.error("UniFi URL list is missing. Set UNIFI_URLS in .env.")
         raise SystemExit(1)
     if not unifi_url_list:
         logger.error("UniFi URL list is empty. Set UNIFI_URLS in .env (comma-separated or JSON array).")
@@ -3084,7 +2247,7 @@ if __name__ == "__main__":
     try:
         netbox_url = config['NETBOX']['URL']
     except (KeyError, TypeError):
-        logger.error("NetBox URL is missing. Set NETBOX_URL in .env or NETBOX.URL in config.")
+        logger.error("NetBox URL is missing. Set NETBOX_URL in .env.")
         raise SystemExit(1)
     if not netbox_url:
         logger.error("NetBox URL is empty. Set NETBOX_URL in .env.")
@@ -3114,7 +2277,7 @@ if __name__ == "__main__":
     except (KeyError, TypeError):
         logger.error(
             "NetBox tenant is missing. Set NETBOX_IMPORT_TENANT or NETBOX_TENANT in .env, "
-            "or NETBOX.TENANT in config."
+            "and ensure the tenant exists in NetBox."
         )
         raise SystemExit(1)
     if not tenant_name:

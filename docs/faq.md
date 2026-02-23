@@ -52,11 +52,8 @@ Controllers are processed in parallel.
 
 Use site mapping:
 ```
-UNIFI_USE_SITE_MAPPING=true
 UNIFI_SITE_MAPPINGS={"UniFi Site Name":"NetBox Site Name"}
 ```
-
-Or use `config/site_mapping.yaml`.
 
 ### Is it possible to set a specific tenant that imports from UniFi should be placed under?
 
@@ -86,7 +83,7 @@ Set `SYNC_INTERVAL=0`. The tool will run one sync cycle and exit. Useful for cro
 The model will still be synced — it just won't have pre-configured interface templates. To add specs, either:
 
 1. Check if the model exists in the [community library](https://github.com/netbox-community/devicetype-library) and update `data/ubiquiti_device_specs.json`
-2. Add an entry to `UNIFI_MODEL_SPECS` in `main.py`
+2. Add an entry to `UNIFI_MODEL_SPECS` in `unifi/model_specs.py`
 
 ---
 

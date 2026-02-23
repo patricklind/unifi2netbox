@@ -2,7 +2,7 @@
 
 Device type enrichment combines two sources at runtime:
 
-1. `UNIFI_MODEL_SPECS` in `main.py` (**42 hardcoded models**)
+1. `UNIFI_MODEL_SPECS` in `unifi/model_specs.py` (**46 hardcoded models**)
 2. `data/ubiquiti_device_specs.json` (community bundle):
    - **173** entries indexed by model (`by_model`)
    - **166** entries indexed by part number (`by_part`)

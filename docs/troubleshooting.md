@@ -57,7 +57,7 @@
 **Problem**: Device type has no interface templates after sync.
 
 **Solutions**:
-- Check if the device model is in `UNIFI_MODEL_SPECS` or the community database
+- Check if the device model is in `unifi/model_specs.py` (`UNIFI_MODEL_SPECS`) or the community database
 - Run with `-v` flag to see debug output for template sync
 - Templates are only synced once per device type per run
 

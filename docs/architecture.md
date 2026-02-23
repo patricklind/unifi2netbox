@@ -70,7 +70,7 @@ Main thread-safe structures in `main.py`:
 
 ## Sync Flow (high-level)
 
-1. Load runtime config (YAML + env override)
+1. Load runtime config from environment variables (`.env`)
 2. Resolve NetBox tenant/roles/sites
 3. Process all configured UniFi controllers in parallel
 4. Per site:

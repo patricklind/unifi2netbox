@@ -1,10 +1,6 @@
 # Configuration Reference
 
-Runtime config is built from:
-- `config/config.yaml` (optional)
-- environment variables
-
-Environment variables always override YAML values.
+Runtime config is built from environment variables (`.env`) only.
 
 ## Required Settings
 
@@ -91,10 +87,8 @@ Configure either:
 
 | Variable | Required | Default in code | Description |
 |---|---|---|---|
-| `UNIFI_USE_SITE_MAPPING` | No | `false` | Enable UniFi->NetBox name mapping |
-| `UNIFI_SITE_MAPPINGS` | No | unset | JSON or `key=value` pairs |
-
-YAML mapping file is also supported: `config/site_mapping.yaml`.
+| `UNIFI_USE_SITE_MAPPING` | No | `false` | Optional legacy toggle (kept for compatibility) |
+| `UNIFI_SITE_MAPPINGS` | No | unset | UniFi->NetBox name mapping (`JSON` or `key=value` pairs) |
 
 ## DHCP / Static IP Behavior
 
@@ -145,23 +139,13 @@ To avoid UniFi writeback entirely, disable DHCP conversion inputs:
 
 Note: `.env.example` sets `SYNC_INTERVAL=600` as an operational default for Docker deployments.
 
-## YAML Example (`config/config.yaml`)
+## `.env` Example
 
-```yaml
-UNIFI:
-  URLS:
-    - "https://controller.example.com/proxy/network/integration/v1"
-  USE_SITE_MAPPING: false
-  SITE_MAPPINGS:
-    "Default": "Main Office"
+```bash
+UNIFI_URLS=https://controller.example.com/proxy/network/integration/v1
+UNIFI_SITE_MAPPINGS={"Default":"Main Office"}
 
-NETBOX:
-  URL: "https://netbox.example.com"
-  TENANT: "My Organization"
-  ROLES:
-    WIRELESS: "Wireless AP"
-    LAN: "Switch"
-    GATEWAY: "Gateway Firewall"
-    ROUTER: "Router"
-    UNKNOWN: "Network Device"
+NETBOX_URL=https://netbox.example.com
+NETBOX_IMPORT_TENANT=My Organization
+NETBOX_ROLES={"WIRELESS":"Wireless AP","LAN":"Switch","GATEWAY":"Gateway Firewall","ROUTER":"Router","UNKNOWN":"Network Device"}
 ```
