@@ -41,6 +41,7 @@ from sync.runtime_config import (
 from sync.vrf import get_existing_vrf, get_or_create_vrf, get_vrf_for_site
 from unifi.unifi import Unifi
 from unifi.model_specs import UNIFI_MODEL_SPECS
+from unifi.spec_refresh import refresh_specs_bundle, write_specs_bundle
 # Suppress only the InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
@@ -1224,6 +1225,39 @@ def _load_community_specs():
     except Exception as e:
         logger.warning(f"Failed to load community device specs: {e}")
         _community_specs = {"by_part": {}, "by_model": {}}
+
+    auto_refresh = _parse_env_bool(os.getenv("UNIFI_SPECS_AUTO_REFRESH"), default=False)
+    if auto_refresh:
+        include_store = _parse_env_bool(os.getenv("UNIFI_SPECS_INCLUDE_STORE"), default=False)
+        library_timeout = _read_env_int("UNIFI_SPECS_REFRESH_TIMEOUT", default=45, minimum=5)
+        store_timeout = _read_env_int("UNIFI_SPECS_STORE_TIMEOUT", default=15, minimum=5)
+        store_workers = _read_env_int("UNIFI_SPECS_STORE_MAX_WORKERS", default=8, minimum=1)
+        write_cache = _parse_env_bool(os.getenv("UNIFI_SPECS_WRITE_CACHE"), default=False)
+        try:
+            refreshed = refresh_specs_bundle(
+                include_store=include_store,
+                library_timeout=library_timeout,
+                store_timeout=store_timeout,
+                store_max_workers=store_workers,
+                logger=logger,
+            )
+            if refreshed.get("by_part"):
+                _community_specs = refreshed
+                logger.info(
+                    "Auto-refreshed community device specs: "
+                    f"{len(_community_specs.get('by_part', {}))} by part, "
+                    f"{len(_community_specs.get('by_model', {}))} by model"
+                )
+                if write_cache:
+                    try:
+                        write_specs_bundle(json_path, _community_specs)
+                        logger.info(f"Wrote refreshed community specs cache to {json_path}")
+                    except Exception as cache_err:
+                        logger.warning(f"Failed to write refreshed community specs cache: {cache_err}")
+            else:
+                logger.warning("Auto-refresh returned empty device specs bundle; keeping bundled specs.")
+        except Exception as refresh_err:
+            logger.warning(f"Auto-refresh of community device specs failed: {refresh_err}")
     return _community_specs
 
 

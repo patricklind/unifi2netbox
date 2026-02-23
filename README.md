@@ -115,6 +115,8 @@ When API key mode is used, header candidates are probed automatically (`X-API-KE
 | `NETBOX_VRF_MODE` | `none`, `existing`, `create` |
 | `NETBOX_DEFAULT_VRF` | Override site-based VRF selection with one VRF name for all imported IPs |
 | `NETBOX_SERIAL_MODE` | `mac`, `unifi`, `id`, `none` |
+| `UNIFI_SPECS_AUTO_REFRESH` | Refresh device specs from upstream Device Type Library at startup |
+| `UNIFI_SPECS_INCLUDE_STORE` | Also enrich specs from UniFi Store technical specs (slower) |
 | `SYNC_INTERVAL` | Loop interval in seconds (`0` = run once) |
 
 HTTP tuning:
@@ -133,8 +135,14 @@ Full reference: [`docs/configuration.md`](docs/configuration.md).
 Runtime merge sources:
 - Hardcoded `UNIFI_MODEL_SPECS` in `unifi/model_specs.py` (**46 models**)
 - Community bundle `data/ubiquiti_device_specs.json` (**173 by model**, **166 by part number**)
+- Optional upstream refresh from `netbox-community/devicetype-library` + UniFi Store specs
 
 Hardcoded fields override community values when both exist.
+
+Manual refresh command:
+```bash
+python3 tools/refresh_unifi_specs.py
+```
 
 Resulting enrichment can include:
 - interface templates and media types
@@ -168,7 +176,7 @@ pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-Current suite: **96 tests**.
+Current suite: **101 tests**.
 
 ## Project Layout
 
@@ -185,10 +193,13 @@ Current suite: **96 tests**.
 │   ├── sites.py
 │   ├── device.py
 │   ├── model_specs.py
+│   ├── spec_refresh.py
 │   ├── networkconf.py
 │   └── wlanconf.py
 ├── data/
 │   └── ubiquiti_device_specs.json
+├── tools/
+│   └── refresh_unifi_specs.py
 ├── docs/
 ├── tests/
 ├── lxc/

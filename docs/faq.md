@@ -80,10 +80,19 @@ Set `SYNC_INTERVAL=0`. The tool will run one sync cycle and exit. Useful for cro
 
 ### How do I add a device model that isn't recognized?
 
-The model will still be synced — it just won't have pre-configured interface templates. To add specs, either:
+The model will still be synced — it just won't have pre-configured interface templates.
 
-1. Check if the model exists in the [community library](https://github.com/netbox-community/devicetype-library) and update `data/ubiquiti_device_specs.json`
-2. Add an entry to `UNIFI_MODEL_SPECS` in `unifi/model_specs.py`
+You now have three options:
+
+1. Run a full refresh from upstream sources:
+```bash
+python3 tools/refresh_unifi_specs.py
+```
+2. Enable startup auto-refresh:
+```bash
+UNIFI_SPECS_AUTO_REFRESH=true
+```
+3. Add manual overrides in `UNIFI_MODEL_SPECS` (`unifi/model_specs.py`) when needed.
 
 ---
 

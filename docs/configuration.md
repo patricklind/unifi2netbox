@@ -90,6 +90,22 @@ Configure either:
 | `UNIFI_USE_SITE_MAPPING` | No | `false` | Optional legacy toggle (kept for compatibility) |
 | `UNIFI_SITE_MAPPINGS` | No | unset | UniFi->NetBox name mapping (`JSON` or `key=value` pairs) |
 
+## Device Specs Auto-Refresh
+
+| Variable | Required | Default in code | Description |
+|---|---|---|---|
+| `UNIFI_SPECS_AUTO_REFRESH` | No | `false` | Refresh bundled specs from upstream Device Type Library on startup |
+| `UNIFI_SPECS_INCLUDE_STORE` | No | `false` | Also enrich from UniFi Store technical specs (slower) |
+| `UNIFI_SPECS_REFRESH_TIMEOUT` | No | `45` | Timeout (seconds) for Device Type Library tarball fetch |
+| `UNIFI_SPECS_STORE_TIMEOUT` | No | `15` | Timeout (seconds) per UniFi Store product request |
+| `UNIFI_SPECS_STORE_MAX_WORKERS` | No | `8` | Parallel workers for UniFi Store enrichment |
+| `UNIFI_SPECS_WRITE_CACHE` | No | `false` | Write refreshed bundle back to `data/ubiquiti_device_specs.json` |
+
+Notes:
+- This is optional and disabled by default.
+- Runtime precedence is still: hardcoded `UNIFI_MODEL_SPECS` overrides community/store data.
+- For one-off/manual refresh, use `python3 tools/refresh_unifi_specs.py`.
+
 ## DHCP / Static IP Behavior
 
 | Variable | Required | Default in code | Description |
