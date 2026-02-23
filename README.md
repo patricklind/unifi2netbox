@@ -88,7 +88,7 @@ Environment variables override YAML.
 | `UNIFI_URLS` | Yes | Comma-separated URLs or JSON array |
 | `NETBOX_URL` | Yes | NetBox base URL |
 | `NETBOX_TOKEN` | Yes | NetBox API token |
-| `NETBOX_TENANT` | Yes | Tenant used for synced objects |
+| `NETBOX_IMPORT_TENANT` or `NETBOX_TENANT` | Yes | Tenant used for synced objects (`NETBOX_IMPORT_TENANT` wins if both are set) |
 | `UNIFI_API_KEY` | Conditionally | Required if not using username/password |
 | `UNIFI_USERNAME` + `UNIFI_PASSWORD` | Conditionally | Required if not using API key |
 
@@ -113,6 +113,7 @@ When API key mode is used, header candidates are probed automatically (`X-API-KE
 | `NETBOX_CLEANUP` | Enable destructive cleanup phase |
 | `CLEANUP_STALE_DAYS` | Stale-device grace period before deletion |
 | `NETBOX_VRF_MODE` | `none`, `existing`, `create` |
+| `NETBOX_DEFAULT_VRF` | Override site-based VRF selection with one VRF name for all imported IPs |
 | `NETBOX_SERIAL_MODE` | `mac`, `unifi`, `id`, `none` |
 | `SYNC_INTERVAL` | Loop interval in seconds (`0` = run once) |
 

@@ -10,6 +10,15 @@ No. Synchronization is one-way: **UniFi → NetBox**. The tool never modifies Un
 
 **Integration API v1** is recommended. It uses API key authentication and provides structured data. Legacy API (username/password) is supported as a fallback for older controllers.
 
+### How do I run against a legacy UniFi controller?
+
+Use a controller base URL (for example `https://controller.example.com:8443`) and set:
+```
+UNIFI_USERNAME=...
+UNIFI_PASSWORD=...
+```
+If `UNIFI_API_KEY` is also set and Integration API probing fails, the client falls back to legacy session login.
+
 ### What happens to offline devices?
 
 By default, offline/disconnected devices are **skipped** during sync (not created). Existing devices that go offline are marked as `status: offline` when `SYNC_STALE_CLEANUP=true`.
@@ -38,6 +47,21 @@ UNIFI_SITE_MAPPINGS={"UniFi Site Name":"NetBox Site Name"}
 ```
 
 Or use `config/site_mapping.yaml`.
+
+### Is it possible to set a specific tenant that imports from UniFi should be placed under?
+
+Yes. Set `NETBOX_IMPORT_TENANT` (or `NETBOX_TENANT`) to an existing NetBox tenant name.
+If both are set, `NETBOX_IMPORT_TENANT` is used.
+
+### Is it possible to set a default VRF for imported IP addresses?
+
+Yes. Set:
+```
+NETBOX_VRF_MODE=existing|create
+NETBOX_DEFAULT_VRF=Shared VRF Name
+```
+`NETBOX_DEFAULT_VRF` overrides site-based VRF naming and applies one VRF name across imports.
+With `NETBOX_VRF_MODE=existing`, the VRF must already exist. With `create`, it will be created if missing.
 
 ### How do I run the sync only once (not continuously)?
 

@@ -13,7 +13,7 @@ Environment variables always override YAML values.
 | `UNIFI_URLS` | Yes | — | Comma-separated list or JSON array |
 | `NETBOX_URL` | Yes | — | NetBox base URL |
 | `NETBOX_TOKEN` | Yes | — | NetBox API token |
-| `NETBOX_TENANT` | Yes | — | Existing tenant name |
+| `NETBOX_IMPORT_TENANT` or `NETBOX_TENANT` | Yes | — | Existing tenant name (`NETBOX_IMPORT_TENANT` takes precedence) |
 | `UNIFI_API_KEY` | * | — | Preferred auth mode |
 | `UNIFI_USERNAME` + `UNIFI_PASSWORD` | * | — | Fallback auth mode |
 
@@ -67,6 +67,7 @@ UNIFI_URLS=https://ctrl1.example.com/proxy/network/integration/v1,https://ctrl2.
 | `NETBOX_VERIFY_SSL` | No | `true` | Verify NetBox TLS certificates |
 | `NETBOX_SERIAL_MODE` | No | `mac` | `mac`, `unifi`, `id`, `none` |
 | `NETBOX_VRF_MODE` | No | `existing` | `none`, `existing`, `create` |
+| `NETBOX_DEFAULT_VRF` | No | empty | If set, use this VRF name for all imported IPs instead of site-based VRF names |
 
 ### Device roles
 

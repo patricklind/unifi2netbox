@@ -56,6 +56,20 @@ _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cl
 _cleanup_serials_lock = threading.Lock()
 
 
+def _normalize_text_value(raw_value) -> str:
+    """
+    Normalize a free-form text value:
+    - trim leading/trailing whitespace
+    - strip one pair of matching surrounding quotes ('...' or "...")
+    """
+    if raw_value is None:
+        return ""
+    text = str(raw_value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
 def _normalize_vrf_name(vrf_name: str) -> str:
     """
     Normalize VRF names so lookups are stable and do not create near-duplicates.
@@ -63,7 +77,7 @@ def _normalize_vrf_name(vrf_name: str) -> str:
     if vrf_name is None:
         return ""
     # Strip and collapse repeated whitespace.
-    return " ".join(str(vrf_name).strip().split())
+    return " ".join(_normalize_text_value(vrf_name).split())
 
 
 def _vrf_cache_key(vrf_name: str) -> str:
@@ -195,26 +209,31 @@ def get_vrf_for_site(nb, site_name: str):
       - none/disabled/off: do not use VRF at all
       - existing/get: use VRF if it exists, never create
       - create/site (legacy behavior): create VRF if missing
+
+    NETBOX_DEFAULT_VRF:
+      - if set, this VRF name is used for all sites instead of site_name
     """
     site_name = _normalize_vrf_name(site_name)
     mode = (os.getenv("NETBOX_VRF_MODE") or "existing").strip().lower()
     if mode in {"none", "disabled", "off"}:
         return None, mode
 
-    # VRF name == site name (no prefix, no "vrf_").
-    if not site_name:
+    default_vrf_name = _normalize_vrf_name(os.getenv("NETBOX_DEFAULT_VRF", ""))
+    target_vrf_name = default_vrf_name or site_name
+
+    if not target_vrf_name:
         return None, mode
 
     if mode in {"create", "site"}:
-        vrf = get_or_create_vrf(nb, site_name)
+        vrf = get_or_create_vrf(nb, target_vrf_name)
         return vrf, mode
 
     if mode in {"existing", "get"}:
-        vrf = get_existing_vrf(nb, site_name)
+        vrf = get_existing_vrf(nb, target_vrf_name)
         return vrf, mode
 
     logger.warning(f"Unknown NETBOX_VRF_MODE='{mode}'. Falling back to 'existing'.")
-    vrf = get_existing_vrf(nb, site_name)
+    vrf = get_existing_vrf(nb, target_vrf_name)
     return vrf, "existing"
 
 def get_postable_fields(base_url, token, url_path):
@@ -970,11 +989,19 @@ def load_runtime_config(config_path="config/config.yaml"):
 
     env_netbox_url = os.getenv("NETBOX_URL")
     if env_netbox_url:
-        netbox_cfg["URL"] = env_netbox_url.strip()
+        netbox_cfg["URL"] = _normalize_text_value(env_netbox_url)
 
-    env_netbox_tenant = os.getenv("NETBOX_TENANT")
-    if env_netbox_tenant:
-        netbox_cfg["TENANT"] = env_netbox_tenant.strip()
+    env_netbox_import_tenant = _normalize_text_value(os.getenv("NETBOX_IMPORT_TENANT"))
+    env_netbox_tenant = _normalize_text_value(os.getenv("NETBOX_TENANT"))
+    if env_netbox_import_tenant and env_netbox_tenant:
+        if env_netbox_import_tenant != env_netbox_tenant:
+            logger.warning(
+                "Both NETBOX_IMPORT_TENANT and NETBOX_TENANT are set with different values. "
+                "Using NETBOX_IMPORT_TENANT."
+            )
+    effective_tenant = env_netbox_import_tenant or env_netbox_tenant
+    if effective_tenant:
+        netbox_cfg["TENANT"] = effective_tenant
 
     env_netbox_roles = _load_roles_from_env()
     if env_netbox_roles:
@@ -3085,13 +3112,22 @@ if __name__ == "__main__":
     try:
         tenant_name = config['NETBOX']['TENANT']
     except (KeyError, TypeError):
-        logger.error("NetBox tenant is missing. Set NETBOX_TENANT in .env or NETBOX.TENANT in config.")
+        logger.error(
+            "NetBox tenant is missing. Set NETBOX_IMPORT_TENANT or NETBOX_TENANT in .env, "
+            "or NETBOX.TENANT in config."
+        )
         raise SystemExit(1)
     if not tenant_name:
-        logger.error("NetBox tenant is empty. Set NETBOX_TENANT in .env.")
+        logger.error("NetBox tenant is empty. Set NETBOX_IMPORT_TENANT or NETBOX_TENANT in .env.")
         raise SystemExit(1)
 
     tenant = nb.tenancy.tenants.get(name=tenant_name)
+    if not tenant:
+        logger.error(
+            f"NetBox tenant '{tenant_name}' was not found. "
+            "Create it in NetBox or update NETBOX_IMPORT_TENANT/NETBOX_TENANT."
+        )
+        raise SystemExit(1)
 
     roles_config = config.get('NETBOX', {}).get('ROLES')
     if not isinstance(roles_config, dict) or not roles_config:

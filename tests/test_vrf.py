@@ -88,3 +88,41 @@ class TestVRFHelpers:
         vrf, mode = main.get_vrf_for_site(nb, "Vig Festival")
         assert mode == "none"
         assert vrf is None
+
+    @patch.dict(
+        os.environ,
+        {"NETBOX_VRF_MODE": "create", "NETBOX_DEFAULT_VRF": "  Shared   VRF  "},
+        clear=False,
+    )
+    def test_default_vrf_overrides_site_name_in_create_mode(self):
+        nb = FakeNB()
+        vrf, mode = main.get_vrf_for_site(nb, "Vig Festival")
+        assert mode == "create"
+        assert vrf is not None
+        assert vrf.name == "Shared VRF"
+        assert nb.ipam.vrfs.create_calls == 1
+
+    @patch.dict(
+        os.environ,
+        {"NETBOX_VRF_MODE": "existing", "NETBOX_DEFAULT_VRF": "Shared VRF"},
+        clear=False,
+    )
+    def test_default_vrf_uses_existing_vrf(self):
+        nb = FakeNB(existing=[FakeVRF(42, "Shared VRF")])
+        vrf, mode = main.get_vrf_for_site(nb, "Some Site")
+        assert mode == "existing"
+        assert vrf is not None
+        assert vrf.id == 42
+        assert nb.ipam.vrfs.create_calls == 0
+
+    @patch.dict(
+        os.environ,
+        {"NETBOX_VRF_MODE": "existing", "NETBOX_DEFAULT_VRF": '"Shared VRF"'},
+        clear=False,
+    )
+    def test_default_vrf_strips_wrapping_quotes(self):
+        nb = FakeNB(existing=[FakeVRF(42, "Shared VRF")])
+        vrf, mode = main.get_vrf_for_site(nb, "Some Site")
+        assert mode == "existing"
+        assert vrf is not None
+        assert vrf.id == 42

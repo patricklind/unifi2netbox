@@ -16,10 +16,12 @@ UNIFI:
     # "Remote Branch": "Branch-01"
 NETBOX:
   URL: http://localhost:8080
+  # Use TENANT for imported UniFi objects
+  # Env aliases: NETBOX_IMPORT_TENANT (preferred) or NETBOX_TENANT
+  TENANT: <name of tenant>
   ROLES:
     WIRELESS: Wireless AP
     LAN: Switch
     GATEWAY: Gateway Firewall
     ROUTER: Router
     UNKNOWN: Network Device
-  TENANT: <name of tenant>

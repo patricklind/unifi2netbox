@@ -33,7 +33,7 @@
 
 **Solutions**:
 - Verify `NETBOX_TOKEN` has write access to DCIM, IPAM, and Tenancy
-- Check that the tenant (`NETBOX_TENANT`) exists in NetBox
+- Check that the tenant (`NETBOX_IMPORT_TENANT` or `NETBOX_TENANT`) exists in NetBox
 - Ensure NetBox is running and accessible from the container
 - Check NetBox logs for more detailed error messages
 
@@ -68,7 +68,7 @@
 **Solutions**:
 - Check logs: `docker compose logs -f`
 - Common cause: syntax errors in `.env` file
-- Ensure all required variables are set (`UNIFI_URLS`, `NETBOX_URL`, `NETBOX_TOKEN`, `NETBOX_TENANT`)
+- Ensure all required variables are set (`UNIFI_URLS`, `NETBOX_URL`, `NETBOX_TOKEN`, `NETBOX_IMPORT_TENANT`/`NETBOX_TENANT`)
 - Verify Python syntax: `python -m py_compile main.py`
 
 ---
