@@ -15,7 +15,7 @@ Exception: when DHCP-to-static conversion is enabled and triggered, the tool upd
 | Auth methods | API key or username/password (optional MFA secret) |
 | Sync scope | Devices, interfaces, VLANs, WLANs, uplink cables, device type templates |
 | Deployment | Docker, Proxmox LXC helper, bare-metal/VM via systemd installer |
-| Test suite | 96 pytest tests |
+| Test suite | 109 pytest tests |
 
 ## Sync Scope
 
@@ -176,7 +176,7 @@ pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-Current suite: **101 tests**.
+Current suite: **109 tests**.
 
 ## Project Layout
 
@@ -185,6 +185,7 @@ Current suite: **101 tests**.
 ├── main.py
 ├── sync/
 │   ├── ipam.py
+│   ├── log_sanitizer.py
 │   ├── runtime_config.py
 │   └── vrf.py
 ├── unifi/

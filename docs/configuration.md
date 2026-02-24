@@ -24,7 +24,7 @@ Note: `unifi.ui.com` cloud API keys are not equivalent to local UniFi Network In
 | `UNIFI_API_KEY_HEADER` | No | auto-probe | Custom API key header; if omitted, standard headers are probed |
 | `UNIFI_MFA_SECRET` | No | unset | Optional TOTP for session login |
 | `UNIFI_VERIFY_SSL` | No | `true` | Verify UniFi TLS certificates |
-| `UNIFI_PERSIST_SESSION` | No | `true` | Persist UniFi session cache to `~/.unifi_session.json` |
+| `UNIFI_PERSIST_SESSION` | No | `true` | Persist UniFi session cache to `~/.unifi_session.json` (file mode enforced to `0600`, and tightened automatically on load if too open) |
 | `UNIFI_REQUEST_TIMEOUT` | No | `15` | Request timeout in seconds |
 | `UNIFI_HTTP_RETRIES` | No | `3` | Retry attempts for transient failures |
 | `UNIFI_RETRY_BACKOFF_BASE` | No | `1.0` | Exponential backoff base delay (seconds) |

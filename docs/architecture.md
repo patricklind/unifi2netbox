@@ -32,7 +32,7 @@ UniFi Controller(s)
   - `/api/auth/login` (UniFi OS)
   - `/api/login` (legacy)
 - Uses cookie session and optional CSRF token
-- Session metadata is cached in `~/.unifi_session.json`
+- Session metadata is cached in `~/.unifi_session.json` with file mode `0600` (and auto-tightened if existing file permissions are too open)
 
 ## Request Behavior
 
