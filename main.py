@@ -1570,10 +1570,10 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                             f"Device type {device_model} already exists after duplicate create error; reusing ID {nb_device_type.id}."
                         )
                     else:
-                        logger.error(f"Failed to recover duplicate device type for {device_name} at site {site}: {e}")
+                        logger.error("Failed to recover duplicate device type after create conflict")
                         return
                 else:
-                    logger.error(f"Failed to create device type for {device_name} at site {site}: {e}")
+                    logger.error("Failed to create device type in NetBox")
                     return
         # Ensure device type has correct specs (ports, PoE, part number, etc.)
         ensure_device_type_specs(nb, nb_device_type, device_model)
@@ -1609,8 +1609,8 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                 try:
                     nb_device.save()
                     logger.info(f"Updated asset tag for {device_name} to {asset_tag}")
-                except pynetbox.core.query.RequestError as e:
-                    logger.warning("Failed to update asset tag for %s: %s", device_name, e)
+                except pynetbox.core.query.RequestError:
+                    logger.warning("Failed to update asset tag for existing device")
         else:
             # Create NetBox Device
             try:
@@ -1755,7 +1755,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                             )
                         device_ip = new_ip
                     else:
-                        logger.info(f"No available static IP for {device_name}. Keeping DHCP IP {device_ip}.")
+                        logger.info("No available static IP found; keeping current DHCP assignment")
                 else:
                     logger.info(f"No prefix found for DHCP IP {device_ip}. Keeping DHCP IP.")
         # --- End DHCP-to-static ---

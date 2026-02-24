@@ -396,12 +396,12 @@ def set_unifi_device_static_ip(
         or "unknown-device"
     )
     if not device_id:
-        logger.warning(f"Cannot set static IP on {device_name}: no device ID")
+        logger.warning("Cannot set static IP: missing UniFi device ID")
         return False
 
     site_api_id = getattr(site_obj, "api_id", None) or getattr(site_obj, "_id", None)
     if not site_api_id:
-        logger.warning(f"Cannot set static IP on {device_name}: no site API ID")
+        logger.warning("Cannot set static IP: missing UniFi site API ID")
         return False
 
     if not gateway:
@@ -432,15 +432,12 @@ def set_unifi_device_static_ip(
             if isinstance(response, dict):
                 status = response.get("statusCode") or response.get("status")
                 if status and int(status) >= 400:
-                    logger.warning(
-                        f"Failed to set static IP on {device_name} via Integration API: "
-                        f"{response.get('message', response)}"
-                    )
+                    logger.warning("Failed to set static IP on UniFi device via Integration API")
                     return False
-            logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
+            logger.info("Set static IP on UniFi device via Integration API")
             return True
-        except Exception as e:
-            logger.warning(f"Failed to set static IP on {device_name}: {e}")
+        except Exception:
+            logger.warning("Failed to set static IP on UniFi device via Integration API request exception")
             return False
 
     config_network = {
@@ -462,11 +459,11 @@ def set_unifi_device_static_ip(
         if isinstance(response, dict):
             meta = response.get("meta", {})
             if isinstance(meta, dict) and meta.get("rc") == "ok":
-                logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
+                logger.info("Set static IP on UniFi device via Legacy API")
                 return True
-            logger.warning(f"Failed to set static IP on {device_name} via legacy API: {response}")
+            logger.warning("Failed to set static IP on UniFi device via Legacy API")
             return False
         return False
-    except Exception as e:
-        logger.warning(f"Failed to set static IP on {device_name}: {e}")
+    except Exception:
+        logger.warning("Failed to set static IP on UniFi device via Legacy API request exception")
         return False
