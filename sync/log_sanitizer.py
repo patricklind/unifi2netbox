@@ -7,18 +7,34 @@ import re
 
 REDACTED = "[REDACTED]"
 
-_REDACTION_PATTERNS = (
-    re.compile(
-        r"(?i)(\bAuthorization\b['\"]?\s*[:=]\s*['\"]?(?:Bearer|Token)\s+)([^'\",\s}]+)"
+_REDACTION_RULES = (
+    (
+        re.compile(
+            r"(?i)(\bAuthorization\b['\"]?\s*[:=]\s*['\"]?(?:Bearer|Token)\s+)([^'\",\s}]+)"
+        ),
+        rf"\1{REDACTED}",
     ),
-    re.compile(
-        r"(?i)(\bX-API-KEY\b['\"]?\s*[:=]\s*['\"]?)([^'\",\s}]+)"
+    (
+        re.compile(
+            r"(?i)(\bX-API-KEY\b['\"]?\s*[:=]\s*['\"]?)([^'\",\s}]+)"
+        ),
+        rf"\1{REDACTED}",
     ),
-    re.compile(
-        r"(?i)(['\"]?(?:NETBOX_TOKEN|UNIFI_API_KEY|UNIFI_PASSWORD|UNIFI_MFA_SECRET|API_KEY|ACCESS_TOKEN|TOKEN|PASSWORD|SECRET|CSRF_TOKEN|X_CSRF_TOKEN)['\"]?\s*[:=]\s*['\"]?)([^'\",&\s}]+)"
+    (
+        re.compile(
+            r"(?i)(['\"]?(?:NETBOX_TOKEN|UNIFI_API_KEY|UNIFI_PASSWORD|UNIFI_MFA_SECRET|API_KEY|ACCESS_TOKEN|TOKEN|PASSWORD|SECRET|CSRF_TOKEN|X_CSRF_TOKEN)['\"]?\s*[:=]\s*['\"]?)([^'\",&\s}]+)"
+        ),
+        rf"\1{REDACTED}",
     ),
-    re.compile(
-        r"(?i)([?&](?:api_key|apikey|access_token|token|password|secret)=)([^&#\s]+)"
+    (
+        re.compile(
+            r"(?i)([?&](?:api_key|apikey|access_token|token|password|secret)=)([^&#\s]+)"
+        ),
+        rf"\1{REDACTED}",
+    ),
+    (
+        re.compile(r"(?i)(https?://[^/\s:@]+:)([^@\s/]+)(@)"),
+        rf"\1{REDACTED}\3",
     ),
 )
 
@@ -29,8 +45,8 @@ def redact_text(value: str) -> str:
         return value
 
     redacted = value
-    for pattern in _REDACTION_PATTERNS:
-        redacted = pattern.sub(rf"\1{REDACTED}", redacted)
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
     return redacted
 
 

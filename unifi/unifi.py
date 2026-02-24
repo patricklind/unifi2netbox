@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-import random
+import secrets
 import threading
 import time
 import warnings
@@ -20,6 +20,7 @@ file_lock = threading.Lock()
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
+_JITTER_RANDOM = secrets.SystemRandom()
 
 
 class Unifi:
@@ -226,7 +227,7 @@ class Unifi:
             return min(self.retry_backoff_max, retry_after_seconds)
         base_delay = self.retry_backoff_base * (2 ** max(0, attempt_number))
         delay = min(self.retry_backoff_max, base_delay)
-        jitter = delay * random.uniform(0.0, 0.25)
+        jitter = delay * _JITTER_RANDOM.uniform(0.0, 0.25)
         return min(self.retry_backoff_max, delay + jitter)
 
     @staticmethod

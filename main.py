@@ -18,28 +18,21 @@ from sync import ipam as ipam_helpers
 from sync import vrf as vrf_helpers
 from sync.ipam import (
     _get_network_info_for_ip,
-    _parse_env_dhcp_ranges,
     extract_dhcp_ranges_from_unifi,
     find_available_static_ip,
-    get_all_dhcp_ranges,
     is_ip_in_dhcp_range,
-    ping_ip,
     set_unifi_device_static_ip,
 )
 from sync.runtime_config import (
-    _load_roles_from_env,
     _netbox_verify_ssl,
     _parse_env_bool,
-    _parse_env_list,
-    _parse_env_mapping,
     _read_env_int,
     _sync_interval_seconds,
-    _unifi_verify_ssl,
-    load_config,
     load_runtime_config,
 )
+from sync.runtime_config import _unifi_verify_ssl  # noqa: F401
 from sync.log_sanitizer import SensitiveDataFormatter
-from sync.vrf import get_existing_vrf, get_or_create_vrf, get_vrf_for_site
+from sync.vrf import get_or_create_vrf, get_vrf_for_site  # noqa: F401
 from unifi.unifi import Unifi
 from unifi.model_specs import UNIFI_MODEL_SPECS
 from unifi.spec_refresh import refresh_specs_bundle, write_specs_bundle
@@ -995,7 +988,7 @@ def sync_device_interfaces(nb, nb_device, device, api_style="integration", unifi
     Sync physical port and radio interfaces from UniFi device data to NetBox.
     Upsert: match by device_id + interface name, create if missing, update if changed.
     """
-    if not os.getenv("SYNC_INTERFACES", "true").strip().lower() in ("true", "1", "yes"):
+    if os.getenv("SYNC_INTERFACES", "true").strip().lower() not in ("true", "1", "yes"):
         return
 
     device_name = get_device_name(device)
@@ -1338,8 +1331,10 @@ def _sync_templates(nb, nb_device_type, model, template_endpoint, expected, labe
             try:
                 tmpl.delete()
                 logger.debug(f"Deleted duplicate {label} template '{key}' from {model}")
-            except Exception:
-                pass
+            except Exception as err:
+                logger.debug(
+                    f"Failed deleting duplicate {label} template '{key}' from {model}: {err}"
+                )
 
     # Build comparison sets
     expected_set = set()
@@ -1362,8 +1357,10 @@ def _sync_templates(nb, nb_device_type, model, template_endpoint, expected, labe
     for tmpl in existing_by_name.values():
         try:
             tmpl.delete()
-        except Exception:
-            pass
+        except Exception as err:
+            logger.debug(
+                f"Failed deleting existing {label} template '{tmpl.name}' from {model}: {err}"
+            )
 
     for entry in expected:
         create_data = {
@@ -1378,8 +1375,10 @@ def _sync_templates(nb, nb_device_type, model, template_endpoint, expected, labe
                 create_data[opt_field] = entry[opt_field]
         try:
             template_endpoint.create(create_data)
-        except pynetbox.core.query.RequestError:
-            pass
+        except pynetbox.core.query.RequestError as err:
+            logger.warning(
+                f"Failed to create {label} template '{entry['name']}' for {model}: {err}"
+            )
     logger.info(f"Synced {len(expected)} {label} templates for {model}")
 
 
@@ -1611,7 +1610,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                     nb_device.save()
                     logger.info(f"Updated asset tag for {device_name} to {asset_tag}")
                 except pynetbox.core.query.RequestError as e:
-                    logger.warning(f"Failed to update asset tag for {device_name}: {e}")
+                    logger.warning("Failed to update asset tag for %s: %s", device_name, e)
         else:
             # Create NetBox Device
             try:
@@ -2105,8 +2104,10 @@ def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials):
                         logger.debug(f"Stale device {dev.name} ({serial}) last updated {age_days}d ago, "
                                      f"grace={grace_days}d — skipping")
                         continue
-                except Exception:
-                    pass
+                except Exception as err:
+                    logger.debug(
+                        f"Could not parse last_updated for stale-check on {dev.name} ({serial}): {err}"
+                    )
         # Delete the device and its interfaces/IPs
         try:
             dev.delete()

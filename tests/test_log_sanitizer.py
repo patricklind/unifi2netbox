@@ -25,6 +25,13 @@ def test_redact_query_parameters():
     assert "keep=value" in redacted
 
 
+def test_redact_basic_auth_in_url():
+    text = "Request to https://admin:supersecret@example.test/proxy/network"
+    redacted = redact_text(text)
+    assert "supersecret" not in redacted
+    assert "https://admin:[REDACTED]@example.test/proxy/network" in redacted
+
+
 def test_formatter_redacts_final_rendered_message():
     record = logging.LogRecord(
         name="test",
@@ -39,4 +46,3 @@ def test_formatter_redacts_final_rendered_message():
     rendered = formatter.format(record)
     assert "abcd1234" not in rendered
     assert f"Authorization=Token {REDACTED}" in rendered
-

@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
-import subprocess
+import subprocess  # nosec B404
 import threading
 
 import requests
@@ -236,15 +236,19 @@ def _get_network_info_for_ip(ip_str: str) -> tuple[str | None, list[str]]:
 def ping_ip(ip_str: str, count: int = 2, timeout: int = 1) -> bool:
     """Ping an IP address. Returns True if host responds (IP in use), False if not."""
     try:
-        cmd = ["ping", "-c", str(count), "-W", str(timeout), ip_str]
-        result = subprocess.run(
+        target_ip = str(ipaddress.ip_address(ip_str))
+        safe_count = max(1, min(5, int(count)))
+        safe_timeout = max(1, min(5, int(timeout)))
+        cmd = ["ping", "-c", str(safe_count), "-W", str(safe_timeout), target_ip]
+        result = subprocess.run(  # nosec B603
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=count * timeout + 5,
+            timeout=safe_count * safe_timeout + 5,
+            check=False,
         )
         return result.returncode == 0
-    except (subprocess.TimeoutExpired, Exception) as e:
+    except (ValueError, TypeError, subprocess.TimeoutExpired, Exception) as e:
         logger.debug(f"Ping to {ip_str} failed/timed out: {e}")
         return False
 

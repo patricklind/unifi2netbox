@@ -1,7 +1,7 @@
 """Tests for gateway/DNS lookup and DHCP range extraction with network info."""
 import ipaddress
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import main
 
