@@ -237,6 +237,10 @@ If my repositories are useful:
   </a>
 </p>
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=patricklind/unifi2netbox&type=date&legend=top-left)](https://www.star-history.com/#patricklind/unifi2netbox&type=date&legend=top-left)
+
 ## License
 
 MIT (`LICENSE`).
