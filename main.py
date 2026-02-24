@@ -38,6 +38,7 @@ from sync.runtime_config import (
     load_config,
     load_runtime_config,
 )
+from sync.log_sanitizer import SensitiveDataFormatter
 from sync.vrf import get_existing_vrf, get_or_create_vrf, get_vrf_for_site
 from unifi.unifi import Unifi
 from unifi.model_specs import UNIFI_MODEL_SPECS
@@ -235,7 +236,7 @@ def setup_logging(min_log_level=logging.INFO):
     logger.setLevel(logging.DEBUG)  # Capture all log levels
 
     # Define a log format
-    log_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    log_format = SensitiveDataFormatter("%(asctime)s - %(levelname)s - %(message)s")
 
     # Set up file handlers for each log level
     for level_name, level_value in log_levels.items():
