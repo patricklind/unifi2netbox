@@ -519,8 +519,10 @@ class Unifi:
                 logger.warning(
                     f"UniFi session file {self.SESSION_FILE} permissions are too open ({oct(file_mode)})."
                 )
-        except OSError:
-            pass
+        except OSError as err:
+            logger.debug(
+                f"Could not stat UniFi session file permissions for {self.SESSION_FILE}: {err}"
+            )
 
         try:
             with open(self.SESSION_FILE, "r") as f:

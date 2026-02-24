@@ -14,6 +14,8 @@ Production-focused synchronization from UniFi controllers to NetBox.
 - [FAQ](./faq.html)
 - [Cleanup](./cleanup.html)
 - [Device Specs](./device-specs.html)
+- [QA Checklist](./qa-checklist.html)
+- [Bug Report](./bug-report.html)
 
 ## Notes
 
