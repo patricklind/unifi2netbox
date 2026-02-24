@@ -77,6 +77,31 @@ def test_session_cache_does_not_persist_auth_headers(monkeypatch, tmp_path):
     assert mode & 0o077 == 0
 
 
+def test_load_session_tightens_file_permissions(monkeypatch, tmp_path):
+    unifi = _build_unifi(monkeypatch)
+    session_file = tmp_path / "unifi_session.json"
+    monkeypatch.setattr(Unifi, "SESSION_FILE", str(session_file))
+
+    payload = {
+        unifi.base_url: {
+            "cookies": {"TOKEN": "cookie"},
+            "csrf_token": "csrf",
+            "auth_mode": "api_key",
+            "api_prefix": "/proxy/network/api/s/default",
+            "api_style": "integration",
+            "integration_api_base": "https://controller.example.com/proxy/network/integration/v1",
+        }
+    }
+    with open(session_file, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.chmod(session_file, 0o644)
+
+    unifi.load_session_from_file()
+
+    mode = os.stat(session_file).st_mode & 0o777
+    assert mode & 0o077 == 0
+
+
 def test_integration_request_retries_on_transient_status(monkeypatch):
     unifi = _build_unifi(monkeypatch)
     unifi.integration_api_base = "https://controller.example.com/proxy/network/integration/v1"

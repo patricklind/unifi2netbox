@@ -519,6 +519,15 @@ class Unifi:
                 logger.warning(
                     f"UniFi session file {self.SESSION_FILE} permissions are too open ({oct(file_mode)})."
                 )
+                try:
+                    os.chmod(self.SESSION_FILE, 0o600)
+                    logger.info(
+                        f"Tightened UniFi session file permissions for {self.SESSION_FILE} to 0o600."
+                    )
+                except OSError as chmod_err:
+                    logger.warning(
+                        f"Could not tighten UniFi session file permissions for {self.SESSION_FILE}: {chmod_err}"
+                    )
         except OSError as err:
             logger.debug(
                 f"Could not stat UniFi session file permissions for {self.SESSION_FILE}: {err}"
