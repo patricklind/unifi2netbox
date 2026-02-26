@@ -21,6 +21,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/opt/unifi2netbox/logs
+ReadWritePaths=/opt/unifi2netbox/data
+ReadWritePaths=/opt/unifi2netbox/.unifi_session.json
 
 # Logging
 StandardOutput=journal

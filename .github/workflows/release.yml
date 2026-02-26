@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing git tag to release (example: v3.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "${TAG}" ]; then
+            echo "Input release_tag is required."
+            exit 1
+          fi
+          if [[ "${TAG}" != v* ]]; then
+            echo "release_tag must start with 'v' (for example v3.1.1)."
+            exit 1
+          fi
+          PRERELEASE=false
+          if [[ "${TAG}" == *"-"* ]]; then
+            PRERELEASE=true
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.meta.outputs.prerelease }}

@@ -2,7 +2,8 @@
 
 Production-focused synchronization from UniFi controllers to NetBox.
 
-Sync direction is one-way: **UniFi -> NetBox**.
+Sync direction is primarily **UniFi -> NetBox**.
+Exception: when DHCP-to-static conversion is enabled and triggered, the tool updates device IP config on UniFi.
 
 [Quick Start](#quick-start) • [Configuration](#configuration) • [Cleanup](#cleanup) • [Testing](#testing) • [Documentation](#documentation)
 
@@ -14,7 +15,7 @@ Sync direction is one-way: **UniFi -> NetBox**.
 | Auth methods | API key or username/password (optional MFA secret) |
 | Sync scope | Devices, interfaces, VLANs, WLANs, uplink cables, device type templates |
 | Deployment | Docker, Proxmox LXC helper, bare-metal/VM via systemd installer |
-| Test suite | 52 pytest tests |
+| Test suite | 109 pytest tests |
 
 ## Sync Scope
 
@@ -25,6 +26,7 @@ Sync direction is one-way: **UniFi -> NetBox**.
 | VLANs | Syncs VLANs from UniFi network data |
 | WLANs | Syncs SSIDs as wireless LAN objects |
 | Cables | Syncs uplink cable relationships |
+| IP behavior | Imports/updates primary IPs in NetBox; optional DHCP->static conversion can write static IP settings back to UniFi |
 | Device types | Enriches models with interface/console/power templates |
 
 ## Architecture
@@ -75,11 +77,8 @@ journalctl -u unifi2netbox -f
 
 ## Configuration
 
-Configuration precedence:
+Configuration source:
 1. Environment variables (`.env`)
-2. YAML (`config/config.yaml`)
-
-Environment variables override YAML.
 
 ### Required Variables
 
@@ -88,7 +87,7 @@ Environment variables override YAML.
 | `UNIFI_URLS` | Yes | Comma-separated URLs or JSON array |
 | `NETBOX_URL` | Yes | NetBox base URL |
 | `NETBOX_TOKEN` | Yes | NetBox API token |
-| `NETBOX_TENANT` | Yes | Tenant used for synced objects |
+| `NETBOX_IMPORT_TENANT` or `NETBOX_TENANT` | Yes | Tenant used for synced objects (`NETBOX_IMPORT_TENANT` wins if both are set) |
 | `UNIFI_API_KEY` | Conditionally | Required if not using username/password |
 | `UNIFI_USERNAME` + `UNIFI_PASSWORD` | Conditionally | Required if not using API key |
 
@@ -100,6 +99,7 @@ Environment variables override YAML.
 | Session login fallback | Controller base URL | Username/password (`UNIFI_USERNAME`, `UNIFI_PASSWORD`), optional `UNIFI_MFA_SECRET` |
 
 When API key mode is used, header candidates are probed automatically (`X-API-KEY`, `Authorization`, or custom `UNIFI_API_KEY_HEADER`).
+`unifi.ui.com` cloud API keys are not the same as local Network Application Integration API keys and are not supported as drop-in replacements here.
 
 ### Common Toggles
 
@@ -113,7 +113,10 @@ When API key mode is used, header candidates are probed automatically (`X-API-KE
 | `NETBOX_CLEANUP` | Enable destructive cleanup phase |
 | `CLEANUP_STALE_DAYS` | Stale-device grace period before deletion |
 | `NETBOX_VRF_MODE` | `none`, `existing`, `create` |
+| `NETBOX_DEFAULT_VRF` | Override site-based VRF selection with one VRF name for all imported IPs |
 | `NETBOX_SERIAL_MODE` | `mac`, `unifi`, `id`, `none` |
+| `UNIFI_SPECS_AUTO_REFRESH` | Refresh device specs from upstream Device Type Library at startup |
+| `UNIFI_SPECS_INCLUDE_STORE` | Also enrich specs from UniFi Store technical specs (slower) |
 | `SYNC_INTERVAL` | Loop interval in seconds (`0` = run once) |
 
 HTTP tuning:
@@ -130,10 +133,16 @@ Full reference: [`docs/configuration.md`](docs/configuration.md).
 ## Device Type Enrichment
 
 Runtime merge sources:
-- Hardcoded `UNIFI_MODEL_SPECS` in `main.py` (**42 models**)
+- Hardcoded `UNIFI_MODEL_SPECS` in `unifi/model_specs.py` (**46 models**)
 - Community bundle `data/ubiquiti_device_specs.json` (**173 by model**, **166 by part number**)
+- Optional upstream refresh from `netbox-community/devicetype-library` + UniFi Store specs
 
 Hardcoded fields override community values when both exist.
+
+Manual refresh command:
+```bash
+python3 tools/refresh_unifi_specs.py
+```
 
 Resulting enrichment can include:
 - interface templates and media types
@@ -167,25 +176,31 @@ pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-Current suite: **52 tests**.
+Current suite: **109 tests**.
 
 ## Project Layout
 
 ```text
 .
 ├── main.py
+├── sync/
+│   ├── ipam.py
+│   ├── log_sanitizer.py
+│   ├── runtime_config.py
+│   └── vrf.py
 ├── unifi/
 │   ├── unifi.py
 │   ├── resources.py
 │   ├── sites.py
 │   ├── device.py
+│   ├── model_specs.py
+│   ├── spec_refresh.py
 │   ├── networkconf.py
 │   └── wlanconf.py
 ├── data/
 │   └── ubiquiti_device_specs.json
-├── config/
-│   ├── config.yaml.SAMPLE
-│   └── site_mapping.yaml
+├── tools/
+│   └── refresh_unifi_specs.py
 ├── docs/
 ├── tests/
 ├── lxc/
@@ -211,6 +226,20 @@ TLS verification is configurable per side:
 - `NETBOX_VERIFY_SSL` (default `true`)
 
 Set either to `false` only if you explicitly accept the risk (for example lab environments with self-signed certs).
+
+## Support
+
+If my repositories are useful:
+
+<p align="center">
+  <a href="https://www.buymeacoffee.com/patricklind">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="50"/>
+  </a>
+</p>
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=patricklind/unifi2netbox&type=date&legend=top-left)](https://www.star-history.com/#patricklind/unifi2netbox&type=date&legend=top-left)
 
 ## License
 

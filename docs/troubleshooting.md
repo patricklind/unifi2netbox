@@ -21,9 +21,11 @@
 
 **Solutions**:
 - **Integration API**: verify `UNIFI_API_KEY` is valid and has read access
+- `unifi.ui.com` cloud API keys are not interchangeable with local Integration API keys
 - **Legacy API**: verify username/password, check if MFA is required (`UNIFI_MFA_SECRET`)
 - Session cookies may expire — the tool handles re-authentication automatically
 - Check if the API key has been revoked or rotated
+- If local Integration API is unavailable, switch to base controller URL + `UNIFI_USERNAME`/`UNIFI_PASSWORD`
 
 ---
 
@@ -33,7 +35,7 @@
 
 **Solutions**:
 - Verify `NETBOX_TOKEN` has write access to DCIM, IPAM, and Tenancy
-- Check that the tenant (`NETBOX_TENANT`) exists in NetBox
+- Check that the tenant (`NETBOX_IMPORT_TENANT` or `NETBOX_TENANT`) exists in NetBox
 - Ensure NetBox is running and accessible from the container
 - Check NetBox logs for more detailed error messages
 
@@ -55,7 +57,7 @@
 **Problem**: Device type has no interface templates after sync.
 
 **Solutions**:
-- Check if the device model is in `UNIFI_MODEL_SPECS` or the community database
+- Check if the device model is in `unifi/model_specs.py` (`UNIFI_MODEL_SPECS`) or the community database
 - Run with `-v` flag to see debug output for template sync
 - Templates are only synced once per device type per run
 
@@ -68,7 +70,7 @@
 **Solutions**:
 - Check logs: `docker compose logs -f`
 - Common cause: syntax errors in `.env` file
-- Ensure all required variables are set (`UNIFI_URLS`, `NETBOX_URL`, `NETBOX_TOKEN`, `NETBOX_TENANT`)
+- Ensure all required variables are set (`UNIFI_URLS`, `NETBOX_URL`, `NETBOX_TOKEN`, `NETBOX_IMPORT_TENANT`/`NETBOX_TENANT`)
 - Verify Python syntax: `python -m py_compile main.py`
 
 ---
