@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-import random
+import secrets
 import threading
 import time
 import warnings
@@ -20,6 +20,7 @@ file_lock = threading.Lock()
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
+_JITTER_RANDOM = secrets.SystemRandom()
 
 
 class Unifi:
@@ -226,7 +227,7 @@ class Unifi:
             return min(self.retry_backoff_max, retry_after_seconds)
         base_delay = self.retry_backoff_base * (2 ** max(0, attempt_number))
         delay = min(self.retry_backoff_max, base_delay)
-        jitter = delay * random.uniform(0.0, 0.25)
+        jitter = delay * _JITTER_RANDOM.uniform(0.0, 0.25)
         return min(self.retry_backoff_max, delay + jitter)
 
     @staticmethod
@@ -518,8 +519,19 @@ class Unifi:
                 logger.warning(
                     f"UniFi session file {self.SESSION_FILE} permissions are too open ({oct(file_mode)})."
                 )
-        except OSError:
-            pass
+                try:
+                    os.chmod(self.SESSION_FILE, 0o600)
+                    logger.info(
+                        f"Tightened UniFi session file permissions for {self.SESSION_FILE} to 0o600."
+                    )
+                except OSError as chmod_err:
+                    logger.warning(
+                        f"Could not tighten UniFi session file permissions for {self.SESSION_FILE}: {chmod_err}"
+                    )
+        except OSError as err:
+            logger.debug(
+                f"Could not stat UniFi session file permissions for {self.SESSION_FILE}: {err}"
+            )
 
         try:
             with open(self.SESSION_FILE, "r") as f:

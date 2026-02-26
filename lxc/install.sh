@@ -57,13 +57,20 @@ python3 -m venv "${VENV_DIR}"
 # --------------------------------------------------------------------------
 # 5. Directory structure and permissions
 # --------------------------------------------------------------------------
-mkdir -p "${APP_DIR}/logs" "${APP_DIR}/config"
+mkdir -p "${APP_DIR}/logs"
+mkdir -p "${APP_DIR}/data"
 
 # Create .env from example if it does not exist yet
 if [ ! -f "${APP_DIR}/.env" ]; then
     cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
     echo "==> Created ${APP_DIR}/.env — edit it with your credentials before starting."
 fi
+
+# Ensure session cache file exists with secure defaults for systemd hardening
+if [ ! -f "${APP_DIR}/.unifi_session.json" ]; then
+    printf "{}\n" > "${APP_DIR}/.unifi_session.json"
+fi
+chmod 600 "${APP_DIR}/.unifi_session.json"
 
 chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
 
@@ -82,7 +89,6 @@ echo "============================================="
 echo ""
 echo "Next steps:"
 echo "  1. Edit ${APP_DIR}/.env with your credentials"
-echo "  2. (Optional) edit ${APP_DIR}/config/site_mapping.yaml"
-echo "  3. Start:  systemctl start unifi2netbox"
-echo "  4. Logs:   journalctl -u unifi2netbox -f"
+echo "  2. Start:  systemctl start unifi2netbox"
+echo "  3. Logs:   journalctl -u unifi2netbox -f"
 echo ""

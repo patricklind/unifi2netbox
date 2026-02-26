@@ -24,11 +24,16 @@ RUN apt-get update && \
 COPY --from=builder /install /usr/local
 
 COPY main.py /app/
+COPY sync/ /app/sync/
 COPY unifi/ /app/unifi/
-COPY config/ /app/config/
 COPY data/ /app/data/
 
-RUN mkdir -p /app/logs
+RUN addgroup --system app && \
+    adduser --system --ingroup app --home /home/app app && \
+    mkdir -p /app/logs && \
+    chown -R app:app /app /home/app
+
+USER app
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import sys; sys.exit(0)"]

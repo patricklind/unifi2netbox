@@ -2,10 +2,14 @@
 
 Device type enrichment combines two sources at runtime:
 
-1. `UNIFI_MODEL_SPECS` in `main.py` (**42 hardcoded models**)
+1. `UNIFI_MODEL_SPECS` in `unifi/model_specs.py` (**46 hardcoded models**)
 2. `data/ubiquiti_device_specs.json` (community bundle):
    - **173** entries indexed by model (`by_model`)
    - **166** entries indexed by part number (`by_part`)
+
+Optional startup refresh (env-controlled) can rebuild the bundle from:
+- `netbox-community/devicetype-library` (same upstream data used by Device-Type-Library-Import)
+- UniFi Store technical specs (`UNIFI_SPECS_INCLUDE_STORE=true`)
 
 ## Merge Strategy
 
@@ -21,6 +25,31 @@ Device type enrichment combines two sources at runtime:
    - hardcoded fields override
 
 This keeps curated overrides intact while inheriting rich template data from community specs.
+
+## Upstream Refresh Options
+
+### Runtime (automatic)
+
+Set in `.env`:
+
+```bash
+UNIFI_SPECS_AUTO_REFRESH=true
+UNIFI_SPECS_INCLUDE_STORE=false
+```
+
+This refreshes the in-memory bundle at startup before sync begins.
+
+### Manual bundle refresh (recommended for repository updates)
+
+```bash
+python3 tools/refresh_unifi_specs.py
+```
+
+With UniFi Store enrichment disabled:
+
+```bash
+python3 tools/refresh_unifi_specs.py --skip-store
+```
 
 ## Synced Template Types
 

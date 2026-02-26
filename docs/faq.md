@@ -4,11 +4,30 @@
 
 ### Does this tool write anything back to UniFi?
 
-No. Synchronization is one-way: **UniFi → NetBox**. The tool never modifies UniFi configuration.
+Mostly no. The primary sync direction is **UniFi → NetBox**.
+
+Exception: if DHCP-to-static conversion is enabled and a device is found in a DHCP range, the tool can update that device's IP configuration on UniFi to static.
 
 ### Which UniFi API should I use?
 
 **Integration API v1** is recommended. It uses API key authentication and provides structured data. Legacy API (username/password) is supported as a fallback for older controllers.
+
+### Can I use an API key from `unifi.ui.com`?
+
+Not directly. `unifi.ui.com` cloud API keys are different from local UniFi Network Integration API keys.
+
+For this project:
+- Use a local Integration API key with local Integration API endpoints when available, or
+- Use local username/password (legacy/session mode) against your controller base URL.
+
+### How do I run against a legacy UniFi controller?
+
+Use a controller base URL (for example `https://controller.example.com:8443`) and set:
+```
+UNIFI_USERNAME=...
+UNIFI_PASSWORD=...
+```
+If `UNIFI_API_KEY` is also set and Integration API probing fails, the client falls back to legacy session login.
 
 ### What happens to offline devices?
 
@@ -33,11 +52,27 @@ Controllers are processed in parallel.
 
 Use site mapping:
 ```
-UNIFI_USE_SITE_MAPPING=true
 UNIFI_SITE_MAPPINGS={"UniFi Site Name":"NetBox Site Name"}
 ```
 
-Or use `config/site_mapping.yaml`.
+### Is it possible to set a specific tenant that imports from UniFi should be placed under?
+
+Yes. Set `NETBOX_IMPORT_TENANT` (or `NETBOX_TENANT`) to an existing NetBox tenant name.
+If both are set, `NETBOX_IMPORT_TENANT` is used.
+
+### Is it possible to set a default VRF for imported IP addresses?
+
+Yes. Set:
+```
+NETBOX_VRF_MODE=existing|create
+NETBOX_DEFAULT_VRF=Shared VRF Name
+```
+`NETBOX_DEFAULT_VRF` overrides site-based VRF naming and applies one VRF name across imports.
+With `NETBOX_VRF_MODE=existing`, the VRF must already exist. With `create`, it will be created if missing.
+
+### Is a default VRF also applied to imported prefixes?
+
+No new prefixes are imported/created from UniFi by this tool. Prefixes are looked up in NetBox and used for IP assignment logic.
 
 ### How do I run the sync only once (not continuously)?
 
@@ -45,10 +80,19 @@ Set `SYNC_INTERVAL=0`. The tool will run one sync cycle and exit. Useful for cro
 
 ### How do I add a device model that isn't recognized?
 
-The model will still be synced — it just won't have pre-configured interface templates. To add specs, either:
+The model will still be synced — it just won't have pre-configured interface templates.
 
-1. Check if the model exists in the [community library](https://github.com/netbox-community/devicetype-library) and update `data/ubiquiti_device_specs.json`
-2. Add an entry to `UNIFI_MODEL_SPECS` in `main.py`
+You now have three options:
+
+1. Run a full refresh from upstream sources:
+```bash
+python3 tools/refresh_unifi_specs.py
+```
+2. Enable startup auto-refresh:
+```bash
+UNIFI_SPECS_AUTO_REFRESH=true
+```
+3. Add manual overrides in `UNIFI_MODEL_SPECS` (`unifi/model_specs.py`) when needed.
 
 ---
 
