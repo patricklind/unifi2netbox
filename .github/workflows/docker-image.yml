@@ -1,13 +1,10 @@
-name: Docker Image
+name: Docker Image CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      push_image:
-        description: "Push image to GHCR"
-        required: false
-        default: false
-        type: boolean
+  push:
+    branches: [ "devel" ]
+  pull_request:
+    branches: [ "devel" ]
 
 jobs:
   build:
