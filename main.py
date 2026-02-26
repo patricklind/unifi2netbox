@@ -3176,3 +3176,52 @@ if __name__ == "__main__":
             break
         logger.info(f"Sleeping {sync_interval} seconds until next sync...")
         _time.sleep(sync_interval)
+
+
+# filepath: main.py
+from unifi.vm import VirtualMachine
+
+def sync_virtual_machines():
+    """Synchronize virtual machines from UniFi to NetBox."""
+    vms = VirtualMachine.all()
+    for vm in vms:
+        normalized_vm = vm.normalize()
+        # Map VM data to NetBox fields and create/update in NetBox
+        netbox_vm = map_vm_to_netbox(normalized_vm)
+        create_or_update_netbox_vm(netbox_vm)
+
+def map_vm_to_netbox(vm_data):
+    """Map UniFi VM data to NetBox fields."""
+    return {
+        "name": vm_data["name"],
+        "vcpus": vm_data["cpu"],
+        "memory": vm_data["memory"],
+        "status": vm_data["status"],
+    }
+
+def create_or_update_netbox_vm(vm_data):
+    """
+    Create or update a virtual machine in NetBox based on the provided data.
+
+    :param vm_data: A dictionary containing the VM data mapped to NetBox fields.
+    """
+    try:
+        # Check if the VM already exists in NetBox by name
+        existing_vm = nb.virtualization.virtual_machines.get(name=vm_data["name"])
+
+        if existing_vm:
+            # Update the existing VM if any fields have changed
+            updated = False
+            for key, value in vm_data.items():
+                if getattr(existing_vm, key, None) != value:
+                    setattr(existing_vm, key, value)
+                    updated = True
+            if updated:
+                existing_vm.save()
+                logger.info(f"Updated VM '{vm_data['name']}' in NetBox.")
+        else:
+            # Create a new VM in NetBox
+            nb.virtualization.virtual_machines.create(vm_data)
+            logger.info(f"Created VM '{vm_data['name']}' in NetBox.")
+    except Exception as e:
+        logger.error(f"Failed to create or update VM '{vm_data['name']}': {e}")
