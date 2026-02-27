@@ -6,6 +6,7 @@ services:
     container_name: unifi2netbox
     environment:
       - LOG_LEVEL=${LOG_LEVEL}
+      - UNIFI_URLS=${UNIFI_URLS}
       - UNIFI_API_KEY=${UNIFI_API_KEY}
       - UNIFI_API_KEY_HEADER=${UNIFI_API_KEY_HEADER}
       - UNIFI_VERIFY_SSL=${UNIFI_VERIFY_SSL}
