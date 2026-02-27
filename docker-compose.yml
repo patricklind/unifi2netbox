@@ -45,9 +45,5 @@ services:
       - UNIFI_RETRY_BACKOFF_BASE=${UNIFI_RETRY_BACKOFF_BASE}
       - UNIFI_RETRY_BACKOFF_MAX=${UNIFI_RETRY_BACKOFF_MAX}
 
-
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
     command: ["python", "main.py", "-v"]
     restart: unless-stopped
