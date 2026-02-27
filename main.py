@@ -36,6 +36,9 @@ from sync.vrf import get_or_create_vrf, get_vrf_for_site  # noqa: F401
 from unifi.unifi import Unifi
 from unifi.model_specs import UNIFI_MODEL_SPECS
 from unifi.spec_refresh import refresh_specs_bundle, write_specs_bundle
+from unifi.client import Client
+from sync.client import sync_unifi_clients_to_netbox
+
 # Suppress only the InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
@@ -2424,51 +2427,33 @@ if __name__ == "__main__":
         logger.info(f"Sleeping {sync_interval} seconds until next sync...")
         _time.sleep(sync_interval)
 
-
-# filepath: main.py
-from unifi.vm import VirtualMachine
-
-def sync_virtual_machines():
-    """Synchronize virtual machines from UniFi to NetBox."""
-    vms = VirtualMachine.all()
-    for vm in vms:
-        normalized_vm = vm.normalize()
-        # Map VM data to NetBox fields and create/update in NetBox
-        netbox_vm = map_vm_to_netbox(normalized_vm)
-        create_or_update_netbox_vm(netbox_vm)
-
-def map_vm_to_netbox(vm_data):
-    """Map UniFi VM data to NetBox fields."""
-    return {
-        "name": vm_data["name"],
-        "vcpus": vm_data["cpu"],
-        "memory": vm_data["memory"],
-        "status": vm_data["status"],
-    }
-
-def create_or_update_netbox_vm(vm_data):
-    """
-    Create or update a virtual machine in NetBox based on the provided data.
-
-    :param vm_data: A dictionary containing the VM data mapped to NetBox fields.
-    """
-    try:
-        # Check if the VM already exists in NetBox by name
-        existing_vm = nb.virtualization.virtual_machines.get(name=vm_data["name"])
-
-        if existing_vm:
-            # Update the existing VM if any fields have changed
-            updated = False
-            for key, value in vm_data.items():
-                if getattr(existing_vm, key, None) != value:
-                    setattr(existing_vm, key, value)
-                    updated = True
-            if updated:
-                existing_vm.save()
-                logger.info(f"Updated VM '{vm_data['name']}' in NetBox.")
-        else:
-            # Create a new VM in NetBox
-            nb.virtualization.virtual_machines.create(vm_data)
-            logger.info(f"Created VM '{vm_data['name']}' in NetBox.")
-    except Exception as e:
-        logger.error(f"Failed to create or update VM '{vm_data['name']}': {e}")
+# ---------------------------------------------------------
+# SYNCHRONISATION DES CLIENTS (VMs & Physiques)
+# ---------------------------------------------------------
+logger.info("Début de l'extraction des clients depuis UniFi...")
+        
+try:
+    # Récupération des IDs depuis les variables d'environnement (avec "1" comme valeur par défaut)
+    # Assure-toi que "import os" est bien présent tout en haut de ton fichier main.py
+    site_id = int(os.getenv("NETBOX_SITE_ID", "1"))
+    cluster_id = int(os.getenv("NETBOX_CLUSTER_ID", "1"))
+    device_role_id = int(os.getenv("NETBOX_DEVICE_ROLE_ID", "1"))
+    device_type_id = int(os.getenv("NETBOX_DEVICE_TYPE_ID", "1"))
+    # 1. On utilise la classe Client pour récupérer les données.
+    # (Adapte unifi_connection et site selon les variables de ta boucle)
+    unifi_clients = Client.list(unifi_client=unifi_connection, site="default")
+           
+    logger.info(f"{len(unifi_clients)} clients récupérés depuis UniFi.")
+            
+    # 2. On envoie ces objets à notre module de synchronisation NetBox
+    sync_unifi_clients_to_netbox(
+    netbox_api=nb,
+    unifi_clients=unifi_clients,
+    site_id=site_id,
+    cluster_id=cluster_id,
+    device_role_id=device_role_id,
+    device_type_id=device_type_id
+    )
+            
+except Exception as e:
+    logger.error(f"Erreur lors de la synchronisation des clients UniFi : {e}")
