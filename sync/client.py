@@ -101,4 +101,30 @@ def sync_interface(netbox, parent_id, mac, ip, is_vm):
         if existing_iface:
             existing_iface.update(iface_data)
             interface_obj = existing_iface
-        else
+        else:
+            interface_obj = netbox.dcim.interfaces.create(iface_data)
+
+    # 2. Création / Mise à jour de l'adresse IP dans l'IPAM
+    if ip:
+        # NetBox requiert un masque (CIDR). UniFi donne souvent juste l'IP, on force un /32
+        ip_cidr = f"{ip}/32" if "/" not in ip else ip
+        
+        assigned_object_type = "virtualization.vminterface" if is_vm else "dcim.interface"
+        ip_obj = netbox.ipam.ip_addresses.get(address=ip_cidr)
+        
+        ip_data = {
+            "address": ip_cidr,
+            "assigned_object_type": assigned_object_type,
+            "assigned_object_id": interface_obj.id
+        }
+
+        if ip_obj:
+            ip_obj.update(ip_data)
+        else:
+            ip_obj = netbox.ipam.ip_addresses.create(ip_data)
+
+        # 3. Assigner l'IP comme "Primary IP" pour qu'elle s'affiche dans les listes globales
+        if is_vm:
+            netbox.virtualization.virtual_machines.update([{"id": parent_id, "primary_ip4": ip_obj.id}])
+        else:
+            netbox.dcim.devices.update([{"id": parent_id, "primary_ip4": ip_obj.id}])
