@@ -36,6 +36,9 @@ from sync.vrf import get_or_create_vrf, get_vrf_for_site  # noqa: F401
 from unifi.unifi import Unifi
 from unifi.model_specs import UNIFI_MODEL_SPECS
 from unifi.spec_refresh import refresh_specs_bundle, write_specs_bundle
+from unifi.client import Client
+from sync.client import sync_unifi_clients_to_netbox
+
 # Suppress only the InsecureRequestWarning
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
@@ -2390,6 +2393,39 @@ if __name__ == "__main__":
         if nb_ubiquity:
             logger.info(f"Ubiquity manufacturer with ID {nb_ubiquity.id} successfully added to Netbox.")
 
+
+    # ---------------------------------------------------------
+    # SYNCHRONISATION DES CLIENTS (VMs & Physiques)
+    # ---------------------------------------------------------
+    logger.info("Début de l'extraction des clients depuis UniFi...")
+
+    try:
+        # Récupération des IDs depuis les variables d'environnement (avec "1" comme valeur par défaut)
+        # Assure-toi que "import os" est bien présent tout en haut de ton fichier main.py
+        site_id = int(os.getenv("NETBOX_SITE_ID", "1"))
+        cluster_id = int(os.getenv("NETBOX_CLUSTER_ID", "1"))
+        device_role_id = int(os.getenv("NETBOX_DEVICE_ROLE_ID", "1"))
+        device_type_id = int(os.getenv("NETBOX_DEVICE_TYPE_ID", "1"))
+        # 1. On utilise la classe Client pour récupérer les données.
+        # (Adapte unifi_connection et site selon les variables de ta boucle)
+        unifi_clients = Client.list(unifi_client=unifi_connection, site="default")
+
+        logger.info(f"{len(unifi_clients)} clients récupérés depuis UniFi.")
+            
+        # 2. On envoie ces objets à notre module de synchronisation NetBox
+        sync_unifi_clients_to_netbox(
+        netbox_api=nb,
+        unifi_clients=unifi_clients,
+        site_id=site_id,
+        cluster_id=cluster_id,
+        device_role_id=device_role_id,
+        device_type_id=device_type_id
+        )
+
+    except Exception as e:
+        logger.error(f"Erreur lors de la synchronisation des clients UniFi : {e}")
+
+
     # Sync loop — run once or continuously based on SYNC_INTERVAL
     sync_interval = _sync_interval_seconds()
     import time as _time
@@ -2423,3 +2459,5 @@ if __name__ == "__main__":
             break
         logger.info(f"Sleeping {sync_interval} seconds until next sync...")
         _time.sleep(sync_interval)
+
+    
